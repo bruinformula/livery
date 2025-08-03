@@ -4,3 +4,4 @@
 /output/**.usd
 /output/**.usdc
 **/__pycache__
+**.DS_Store
