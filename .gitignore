@@ -1,1 +1,6 @@
-/test_files
+/test_inputs/MK10.STEP
+/output/backup
+/output/**.usda
+/output/**.usd
+/output/**.usdc
+**/__pycache__

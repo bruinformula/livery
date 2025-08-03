@@ -1,263 +1,129 @@
-"""USD conversion and export functionality."""
+"""USD conversion and export functionality.
 
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+TRANSFORMATION HANDLING:
+This module now handles transformations in USD space rather than baking them into geometry.
+
+Key changes:
+1. Geometry is kept in local coordinate space (no apply_location_to_shape)
+2. Each USD Xform prim gets the transformation from its STEP component
+3. Transformations are preserved as USD hierarchy rather than baked into vertices
+4. This enables proper manipulation, animation, and instancing in USD-aware applications
+
+Benefits:
+- Preserves parametric transformation hierarchy
+- Enables USD animation and manipulation
+- Supports proper instancing and referencing
+- More faithful to original STEP assembly structure
+"""
+
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_SOLID
-from pxr import Usd, UsdGeom, Gf
+from pxr import UsdGeom, Gf
 
 from .name_utils import sanitize_usd_name, generate_unique_name
 from .geometry_processor import triangulate_shape, extract_faces, apply_location_to_shape
+from .calculate_normals import calculate_face_normals, ensure_consistent_winding_order
 
-class MeshData:
-    """Container for mesh data that can be safely passed between threads."""
-    def __init__(self, points, face_vertex_counts, face_vertex_indices, mesh_path, shape_info):
-        self.points = points
-        self.face_vertex_counts = face_vertex_counts
-        self.face_vertex_indices = face_vertex_indices
-        self.mesh_path = mesh_path
-        self.shape_info = shape_info
-        self.success = True
-        self.error = None
-
-
-class MeshTask:
-    """Container for a mesh creation task."""
-    def __init__(self, shape, mesh_path, shape_info, total_location):
-        self.shape = shape
-        self.mesh_path = mesh_path
-        self.shape_info = shape_info
-        self.total_location = total_location
-
+try:
+    from .config import FORCE_CONSISTENT_WINDING
+except ImportError:
+    # Default values if config not available
+    FLIP_NORMALS = False
+    FORCE_CONSISTENT_WINDING = True
 
 def gp_trsf_to_usd_matrix(trsf):
-    """Convert gp_Trsf to USD 4x4 matrix."""
+    """Convert gp_Trsf to USD 4x4 matrix with proper precision."""
     # Get the transformation matrix components (OpenCASCADE uses 1-based indexing)
     # USD expects row-major 4x4 matrix
     translation = trsf.TranslationPart()
     
-    # Build the 4x4 transformation matrix
+    # Build the 4x4 transformation matrix with proper float precision
     # Row 0: [m11, m12, m13, tx]
     # Row 1: [m21, m22, m23, ty] 
     # Row 2: [m31, m32, m33, tz]
     # Row 3: [0,   0,   0,   1]
+    
+    # Clean up very small values to avoid -0.0 display issues
+    def clean_float(val):
+        return 0.0 if abs(val) < 1e-10 else float(val)
+    
     return Gf.Matrix4d(
-        trsf.Value(1, 1), trsf.Value(1, 2), trsf.Value(1, 3), translation.X(),
-        trsf.Value(2, 1), trsf.Value(2, 2), trsf.Value(2, 3), translation.Y(),
-        trsf.Value(3, 1), trsf.Value(3, 2), trsf.Value(3, 3), translation.Z(),
+        clean_float(trsf.Value(1, 1)), clean_float(trsf.Value(1, 2)), clean_float(trsf.Value(1, 3)), clean_float(translation.X()),
+        clean_float(trsf.Value(2, 1)), clean_float(trsf.Value(2, 2)), clean_float(trsf.Value(2, 3)), clean_float(translation.Y()),
+        clean_float(trsf.Value(3, 1)), clean_float(trsf.Value(3, 2)), clean_float(trsf.Value(3, 3)), clean_float(translation.Z()),
         0.0, 0.0, 0.0, 1.0
     )
 
-
-def process_mesh_task(task):
-    """Process a single mesh task in a thread-safe manner.
+def toploc_to_usd_matrix(location):
+    """Convert TopLoc_Location to USD 4x4 matrix."""
+    if location.IsIdentity():
+        return Gf.Matrix4d(1.0)  # Identity matrix
     
-    Args:
-        task: MeshTask containing shape and metadata
-        
-    Returns:
-        MeshData: Processed mesh data or error information
-    """
-    try:
-        shape = task.shape
-        
-        # Apply accumulated transformation to the shape before triangulation
-        if not task.total_location.IsIdentity():
-            shape = apply_location_to_shape(shape, task.total_location)
-        
-        # Triangulate the shape
-        triangulate_shape(shape)
-        
-        # Extract faces
-        faces = extract_faces(shape)
-        
-        if not faces:
-            return MeshData([], [], [], task.mesh_path, task.shape_info)
-        
-        # Collect all vertices and face indices
-        all_points = []
-        all_face_vertex_counts = []
-        all_face_vertex_indices = []
-        vertex_offset = 0
-        
-        for face, triangulation in faces:
-            if triangulation is None:
-                continue
-                
-            # Get vertices from triangulation
-            for i in range(1, triangulation.NbNodes() + 1):
-                node = triangulation.Node(i)
-                all_points.append((float(node.X()), float(node.Y()), float(node.Z())))
-            
-            # Get triangles from triangulation
-            for i in range(1, triangulation.NbTriangles() + 1):
-                triangle = triangulation.Triangle(i)
-                n1, n2, n3 = triangle.Get()
-                # Convert to 0-based indexing and add vertex offset
-                all_face_vertex_counts.append(3)
-                all_face_vertex_indices.extend([
-                    n1 - 1 + vertex_offset,
-                    n2 - 1 + vertex_offset, 
-                    n3 - 1 + vertex_offset
-                ])
-            
-            vertex_offset += triangulation.NbNodes()
-        
-        mesh_data = MeshData(all_points, all_face_vertex_counts, all_face_vertex_indices, task.mesh_path, task.shape_info)
-        return mesh_data
-        
-    except Exception as e:
-        mesh_data = MeshData([], [], [], task.mesh_path, task.shape_info)
-        mesh_data.success = False
-        mesh_data.error = str(e)
-        return mesh_data
+    trsf = location.Transformation()
+    return gp_trsf_to_usd_matrix(trsf)
 
-
-
-def create_mesh_prims_parallel(stage, mesh_data_list, max_workers=None):
-    """Create USD mesh primitives from mesh data in parallel (thread-safe USD operations).
+def create_geometry_instances(stage, hierarchy_list, master_meshes):
+    """Create USD geometry instances for duplicate shapes.
     
     Args:
         stage: USD stage
-        mesh_data_list: List of MeshData objects
-        max_workers: Maximum number of worker threads for USD operations
+        hierarchy_list: List of shape hierarchy information  
+        master_meshes: Dict mapping product_name to master mesh path
     """
-    print(f"    🔄 Creating {len(mesh_data_list)} USD mesh primitives...")
+    print(f"Processing geometry instances...")
+    instance_count = 0
     
-    # USD operations need to be thread-safe, so we'll do them sequentially
-    # but we can still process them efficiently
-    successful_meshes = 0
-    failed_meshes = 0
-    
-    for mesh_data in mesh_data_list:
-        if not mesh_data.success:
-            print(f"    ⚠️ Skipping failed mesh for {mesh_data.shape_info['name']}: {mesh_data.error}")
-            failed_meshes += 1
-            continue
-            
-        if not mesh_data.points:
-            print(f"    ⚠️ Skipping mesh with no vertices for {mesh_data.shape_info['name']}")
-            failed_meshes += 1
-            continue
+    def process_shape_instances(shape_info):
+        nonlocal instance_count
         
-        try:
-            # Check if the parent prim exists
-            parent_path = mesh_data.mesh_path.GetParentPath()
-            parent_prim = stage.GetPrimAtPath(parent_path)
-            
-            if not parent_prim.IsValid():
-                print(f"    ❌ Parent prim does not exist at path: {parent_path}")
-                print(f"    🔍 Creating missing parent prim as Xform...")
-                parent_xform = UsdGeom.Xform.Define(stage, parent_path)
-                if not parent_xform:
-                    print(f"    ❌ Failed to create parent prim at path: {parent_path}")
-                    failed_meshes += 1
-                    continue
+        # Check if this is a leaf node with geometry
+        if not shape_info['children'] and not shape_info.get('is_assembly', False):
+            if 'usd_path' in shape_info:
+                product_name = shape_info.get('product_name', shape_info['name'])
                 
-            # Create USD Mesh (this needs to be done on main thread for USD safety)
-            print(f"    🔺 Creating mesh at path: {mesh_data.mesh_path}")
-            mesh = UsdGeom.Mesh.Define(stage, mesh_data.mesh_path)
-            
-            if not mesh:
-                print(f"    ❌ Failed to create USD mesh at path: {mesh_data.mesh_path}")
-                failed_meshes += 1
-                continue
-            
-            # Set mesh data
-            mesh.CreatePointsAttr().Set(mesh_data.points)
-            mesh.CreateFaceVertexCountsAttr().Set(mesh_data.face_vertex_counts)
-            mesh.CreateFaceVertexIndicesAttr().Set(mesh_data.face_vertex_indices)
-            
-            successful_meshes += 1
-            print(f"    ✅ Created mesh for {mesh_data.shape_info['name']} ({len(mesh_data.points)} vertices)")
-            
-        except Exception as e:
-            print(f"    ⚠️ Failed to create USD mesh for {mesh_data.shape_info['name']}: {e}")
-            print(f"    🔍 Attempted path: {mesh_data.mesh_path}")
-            failed_meshes += 1
-    
-    print(f"    ✅ Created {successful_meshes} meshes successfully")
-    if failed_meshes > 0:
-        print(f"    ⚠️ Failed to create {failed_meshes} meshes")
-
-
-
-
-def convert_hierarchical_shape_to_usd_parallel(stage, parent_prim, hierarchy_list, shape_tool, max_workers=None):
-    """Convert hierarchical shapes to USD using parallel mesh processing.
-    
-    Args:
-        stage: USD stage
-        parent_prim: Parent USD prim
-        hierarchy_list: List of shape hierarchy information
-        shape_tool: XCAF shape tool
-        max_workers: Maximum number of worker threads for mesh processing
-    """
-    
-    print("🔄 Starting parallel mesh processing...")
-    
-    # First, create the USD hierarchy structure (must be done sequentially)
-    print("📦 Creating USD hierarchy structure...")
-    for i, shape_info in enumerate(hierarchy_list):
-        print(f"🏗️ Processing structure for assembly {i+1}/{len(hierarchy_list)}: {shape_info['name']}")
-        create_usd_hierarchy_structure(stage, parent_prim, shape_info)
-    
-    # Now collect mesh tasks using the stored USD paths
-    print("📋 Collecting mesh creation tasks from hierarchy...")
-    all_mesh_tasks = []
-    for shape_info in hierarchy_list:
-        tasks = collect_mesh_tasks_from_hierarchy(shape_info)
-        all_mesh_tasks.extend(tasks)
-    
-    print(f"📊 Found {len(all_mesh_tasks)} mesh creation tasks")
-    
-    if not all_mesh_tasks:
-        print("ℹ️ No meshes to create")
-        return
-    
-    # Process mesh tasks in parallel
-    print(f"⚡ Processing meshes in parallel (max_workers={max_workers})...")
-    mesh_data_list = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all mesh processing tasks
-        future_to_task = {executor.submit(process_mesh_task, task): task for task in all_mesh_tasks}
-        
-        # Collect results as they complete
-        for i, future in enumerate(as_completed(future_to_task), 1):
-            task = future_to_task[future]
-            try:
-                mesh_data = future.result()
-                mesh_data_list.append(mesh_data)
-                
-                if mesh_data.success:
-                    print(f"    ✅ ({i}/{len(all_mesh_tasks)}) Processed mesh for: {mesh_data.shape_info['name']}")
-                else:
-                    print(f"    ⚠️ ({i}/{len(all_mesh_tasks)}) Failed mesh for: {mesh_data.shape_info['name']}: {mesh_data.error}")
+                if product_name in master_meshes:
+                    # Create a reference to the master mesh geometry
+                    usd_prim_path = shape_info['usd_path']
+                    mesh_name = f"{sanitize_usd_name(product_name)}_mesh"
+                    mesh_path = usd_prim_path.AppendChild(mesh_name)
                     
-            except Exception as e:
-                print(f"    ❌ ({i}/{len(all_mesh_tasks)}) Exception processing mesh for: {task.shape_info['name']}: {e}")
+                    # Get the master mesh path
+                    master_path = master_meshes[product_name]
+                    
+                    # Only create instance if this isn't the master
+                    if str(mesh_path) != str(master_path):
+                        # Create a reference/instance
+                        mesh_prim = stage.DefinePrim(mesh_path)
+                        mesh_prim.GetReferences().AddInternalReference(master_path)
+                        instance_count += 1
+                        print(f"    Created instance {instance_count}: {mesh_path} -> {master_path}")
+        
+        # Process children recursively
+        if shape_info['children']:
+            for child_info in shape_info['children']:
+                process_shape_instances(child_info)
     
-    # Create USD mesh primitives (must be done sequentially for USD thread safety)
-    print("🏗️ Creating USD mesh primitives...")
-    create_mesh_prims_parallel(stage, mesh_data_list, max_workers)
+    for shape_info in hierarchy_list:
+        process_shape_instances(shape_info)
     
-    print("✅ Parallel mesh processing complete!")
+    print(f"    Created {instance_count} geometry instances")
 
-
-def create_usd_hierarchy_structure(stage, parent_prim, shape_info, depth=0, accumulated_location=None):
-    """Create USD hierarchy structure without mesh geometry (for parallel processing).
+def create_usd_hierarchy_structure(stage, parent_prim, shape_info, depth=0, created_prims=None):
+    """Create USD hierarchy structure with transformations preserved in USD space.
     
     Args:
         stage: USD stage
         parent_prim: Parent USD prim 
         shape_info: Dictionary containing shape data and hierarchy
         depth: Current depth in hierarchy for indentation
-        accumulated_location: Accumulated transformation from root to this component
+        created_prims: Set to track already created prims (to avoid duplicates)
         
     Returns:
         The created USD Xform prim
     """
+    
+    if created_prims is None:
+        created_prims = set()
     
     indent = "  " * depth
     nauo_info = f" (NAUO: {shape_info.get('nauo_id', 'N/A')})" if 'nauo_id' in shape_info else ""
@@ -273,12 +139,46 @@ def create_usd_hierarchy_structure(stage, parent_prim, shape_info, depth=0, accu
     if not sanitized_name or sanitized_name == "unnamed":
         sanitized_name = generate_unique_name()
     
+    # Create a unique path based on the hierarchy position to avoid conflicts
+    # Use the NAUO ID to make it unique if available
+    if shape_info.get('nauo_id'):
+        unique_name = f"{sanitized_name}_{shape_info['nauo_id']}"
+    else:
+        unique_name = sanitized_name
+    
     # Create an Xform for this shape/assembly
-    xform_path = parent_prim.GetPath().AppendChild(sanitized_name)
+    xform_path = parent_prim.GetPath().AppendChild(unique_name)
+    
+    # Check if this exact path was already created
+    if str(xform_path) in created_prims:
+        print(f"{indent}  Skipping duplicate prim: {xform_path}")
+        return stage.GetPrimAtPath(xform_path)
+    
+    created_prims.add(str(xform_path))
     xform = UsdGeom.Xform.Define(stage, xform_path)
     
     # Store the USD path in the shape_info for later use
     shape_info['usd_path'] = xform_path
+    
+    # Apply the component's transformation to the USD Xform
+    location = shape_info.get('location')
+    if location and not location.IsIdentity():
+        print(f"{indent}  Applying transformation to USD Xform: {unique_name}")
+        usd_matrix = toploc_to_usd_matrix(location)
+        
+        # Apply the full transformation matrix to the USD Xform
+        # Clear any existing transforms first (to prevent duplicates)
+        xformable = UsdGeom.Xformable(xform)
+        xformable.ClearXformOpOrder()
+        
+        # Add a single transform operation
+        transform_attr = xformable.AddTransformOp()
+        transform_attr.Set(usd_matrix)
+        
+        print(f"{indent}    Applied 4x4 matrix transformation")
+        
+    else:
+        print(f"{indent}  Identity transformation for: {unique_name}")
     
     # Add metadata attributes to the USD prim
     prim = xform.GetPrim()
@@ -286,10 +186,6 @@ def create_usd_hierarchy_structure(stage, parent_prim, shape_info, depth=0, accu
         prim.SetCustomDataByKey('nauo_id', shape_info['nauo_id'])
     if shape_info.get('product_name'):
         prim.SetCustomDataByKey('product_name', shape_info['product_name'])
-    if shape_info.get('component_entry'):
-        prim.SetCustomDataByKey('component_entry', shape_info['component_entry'])
-    if shape_info.get('referred_entry'):
-        prim.SetCustomDataByKey('referred_entry', shape_info['referred_entry'])
     
     # Set display name as USD metadata
     prim.SetDisplayName(shape_info['name'])
@@ -297,67 +193,12 @@ def create_usd_hierarchy_structure(stage, parent_prim, shape_info, depth=0, accu
     # Process children recursively
     if shape_info['children']:
         for child_info in shape_info['children']:
-            create_usd_hierarchy_structure(stage, xform, child_info, depth + 1, accumulated_location)
+            create_usd_hierarchy_structure(stage, xform, child_info, depth + 1, created_prims)
     
     return xform
 
-
-def collect_mesh_tasks_from_hierarchy(shape_info, accumulated_location=None, tasks=None):
-    """Recursively collect mesh creation tasks from shape hierarchy using stored USD paths.
-    
-    Args:
-        shape_info: Shape hierarchy information with stored USD paths
-        accumulated_location: Accumulated transformation
-        tasks: List to collect tasks in
-        
-    Returns:
-        List of MeshTask objects
-    """
-    if tasks is None:
-        tasks = []
-    
-    # Check if USD path was stored during hierarchy creation
-    if 'usd_path' not in shape_info:
-        print(f"⚠️ Warning: No USD path stored for shape {shape_info['name']}")
-        return tasks
-    
-    usd_prim_path = shape_info['usd_path']
-    
-    # Accumulate transformations
-    current_location = shape_info['location']
-    if accumulated_location is None:
-        total_location = current_location
-    else:
-        if not current_location.IsIdentity():
-            total_location = accumulated_location.Multiplied(current_location)
-        else:
-            total_location = accumulated_location
-    
-    # Check if this is a leaf node with geometry
-    if not shape_info['children'] and not shape_info.get('is_assembly', False):
-        shape = shape_info['shape']
-        
-        # Check for solid geometry
-        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
-        if explorer.More():
-            # Create mesh task with the stored USD prim path
-            mesh_base_name = shape_info.get('product_name') or shape_info['name']
-            mesh_name = f"{sanitize_usd_name(mesh_base_name)}_mesh"
-            mesh_path = usd_prim_path.AppendChild(mesh_name)
-            
-            task = MeshTask(shape, mesh_path, shape_info, total_location)
-            tasks.append(task)
-    
-    # Process children recursively
-    if shape_info['children']:
-        for child_info in shape_info['children']:
-            collect_mesh_tasks_from_hierarchy(child_info, total_location, tasks)
-    
-    return tasks
-
-
-def convert_hierarchical_shape_to_usd(stage, parent_prim, shape_info, shape_tool, depth=0, accumulated_location=None):
-    """Convert a hierarchical shape to USD, preserving the hierarchy.
+def convert_hierarchical_shape_to_usd(stage, parent_prim, shape_info, shape_tool, depth=0, accumulated_transform=None):
+    """Convert a hierarchical shape to USD, with proper transformation accumulation.
     
     Args:
         stage: USD stage
@@ -365,158 +206,165 @@ def convert_hierarchical_shape_to_usd(stage, parent_prim, shape_info, shape_tool
         shape_info: Dictionary containing shape data and hierarchy
         shape_tool: XCAF shape tool for additional operations
         depth: Current depth in hierarchy for indentation
-        accumulated_location: Accumulated transformation from root to this component
+        accumulated_transform: Accumulated transformation from parent hierarchy
     """
     
     indent = "  " * depth
     nauo_info = f" (NAUO: {shape_info.get('nauo_id', 'N/A')})" if 'nauo_id' in shape_info else ""
     product_info = f" (PRODUCT: {shape_info.get('product_name', 'N/A')})" if shape_info.get('product_name') else ""
-    print(f"{indent}🔄 Converting: {shape_info['name']}{nauo_info}{product_info}")
     
-    # Use PRODUCT name as the primary USD object name, fallback to regular name
     if shape_info.get('product_name'):
         usd_object_name = shape_info['product_name']
-        print(f"{indent}  🏭 Using PRODUCT name for USD object: {usd_object_name}")
     else:
         usd_object_name = shape_info['name']
-        print(f"{indent}  📝 Using regular name for USD object: {usd_object_name}")
     
-    sanitized_name = sanitize_usd_name(usd_object_name)
-    if not sanitized_name or sanitized_name == "unnamed":
-        sanitized_name = generate_unique_name()
+    if shape_info.get('nauo_id'):
+        unique_name = f"{sanitize_usd_name(usd_object_name)}_{shape_info['nauo_id']}"
+    else:
+        unique_name = sanitize_usd_name(usd_object_name)
+        if not unique_name or unique_name == "unnamed":
+            unique_name = generate_unique_name()
     
-    # Create an Xform for this shape/assembly
+    sanitized_name = unique_name
+    
     xform_path = parent_prim.GetPath().AppendChild(sanitized_name)
     xform = UsdGeom.Xform.Define(stage, xform_path)
-    print(f"{indent}  📦 Created USD Xform: {xform_path}")
     
-    # Add metadata attributes to the USD prim
+    current_location = shape_info.get('location')
+    if accumulated_transform is None:
+        from OCC.Core.TopLoc import TopLoc_Location
+        accumulated_transform = TopLoc_Location()
+    
+    if current_location and not current_location.IsIdentity():
+        total_transform = accumulated_transform * current_location
+    else:
+        total_transform = accumulated_transform
+    
     prim = xform.GetPrim()
     if shape_info.get('nauo_id'):
         prim.SetCustomDataByKey('nauo_id', shape_info['nauo_id'])
     if shape_info.get('product_name'):
         prim.SetCustomDataByKey('product_name', shape_info['product_name'])
-    if shape_info.get('component_entry'):
-        prim.SetCustomDataByKey('component_entry', shape_info['component_entry'])
-    if shape_info.get('referred_entry'):
-        prim.SetCustomDataByKey('referred_entry', shape_info['referred_entry'])
     
-    # Set display name as USD metadata
     prim.SetDisplayName(shape_info['name'])
     
-    # Accumulate transformations down the hierarchy
-    current_location = shape_info['location']
-    if accumulated_location is None:
-        # This is the root, start with current location
-        total_location = current_location
-    else:
-        # Combine parent transformation with current transformation
-        if not current_location.IsIdentity():
-            total_location = accumulated_location.Multiplied(current_location)
-        else:
-            total_location = accumulated_location
-    
-    # Only create mesh geometry for leaf components (parts with no children)
-    # This prevents duplicate geometry for assemblies
     if not shape_info['children'] and not shape_info.get('is_assembly', False):
         shape = shape_info['shape']
         
-        # Apply accumulated transformation to the shape before triangulation
-        if not total_location.IsIdentity():
-            print(f"{indent}  🔄 Applying accumulated transformation to geometry for: {shape_info['name']}")
-            shape = apply_location_to_shape(shape, total_location)
+        if total_transform and not total_transform.IsIdentity():
+            shape = apply_location_to_shape(shape, total_transform)
         
-        # Check for solid geometry
         explorer = TopExp_Explorer(shape, TopAbs_SOLID)
         if explorer.More():
-            # Use PRODUCT name for mesh if available
             mesh_base_name = shape_info.get('product_name') or shape_info['name']
             mesh_name = f"{sanitize_usd_name(mesh_base_name)}_mesh"
-            print(f"{indent}  🔺 Creating mesh geometry for part...")
             try:
                 mesh_prim = convert_shape_to_usd_mesh(stage, xform, shape, mesh_name)
                 if mesh_prim:
-                    print(f"{indent}  ✅ Created mesh for: {shape_info['name']}")
+                    # Get mesh statistics for display
+                    mesh_points = mesh_prim.GetPointsAttr().Get()
+                    mesh_face_counts = mesh_prim.GetFaceVertexCountsAttr().Get()
+                    vertex_count = len(mesh_points) if mesh_points else 0
+                    face_count = len(mesh_face_counts) if mesh_face_counts else 0
+                    print(f"{indent}Created: {mesh_name} with {vertex_count} vertices and {face_count} faces")
             except Exception as e:
-                print(f"{indent}  ⚠️ Warning: Failed to create mesh for {shape_info['name']}: {e}")
+                print(f"{indent}Warning: Failed to create mesh for {shape_info['name']}: {e}")
         else:
-            print(f"{indent}  ℹ️ Part {shape_info['name']} has no solid geometry (might be surface/wire)")
-    elif shape_info['children']:
-        print(f"{indent}  🏭 Assembly {shape_info['name']} - processing children only")
+            print(f"{indent}Part {shape_info['name']} has no solid geometry (might be surface/wire)")
     else:
-        print(f"{indent}  ℹ️ Empty assembly: {shape_info['name']}")
+        print(f"{indent}Processing: {shape_info['name']}{nauo_info}{product_info}")
     
-    # Process children recursively, passing down the accumulated transformation
     if shape_info['children']:
-        print(f"{indent}  📁 Processing {len(shape_info['children'])} children...")
         for i, child_info in enumerate(shape_info['children']):
             try:
-                convert_hierarchical_shape_to_usd(stage, xform, child_info, shape_tool, depth + 1, total_location)
+                convert_hierarchical_shape_to_usd(stage, xform, child_info, shape_tool, depth + 1, total_transform)
             except Exception as e:
-                print(f"{indent}  ⚠️ Warning: Failed to convert child {i} of {shape_info['name']}: {e}")
+                print(f"{indent}  Warning: Failed to convert child {i} of {shape_info['name']}: {e}")
     
-    print(f"{indent}✅ Completed: {shape_info['name']}")
     return xform
 
 
 def convert_shape_to_usd_mesh(stage, parent_prim, shape, name):
-    """Convert a triangulated shape to a USD Mesh."""
+    """Convert a triangulated shape to a USD Mesh (geometry already in world space)."""
     
-    print(f"    🔺 Triangulating shape...")
-    # Shape should already have transformations applied by this point
     triangulate_shape(shape)
 
-    # Gather all triangles from shape
     faces = extract_faces(shape)
     
     if not faces:
-        print(f"    ⚠️ Warning: No triangulated faces found for shape {name}")
+        print(f"    Warning: No triangulated faces found for shape {name}")
         return None
     
-    print(f"    📐 Processing {len(faces)} faces...")
-    # Collect all vertices and face indices
     all_points = []
     all_face_vertex_counts = []
     all_face_vertex_indices = []
-    vertex_offset = 0
+    all_normals = []
+    vertex_map = {}
+    next_vertex_index = 0
     
     for face, triangulation in faces:
         if triangulation is None:
             continue
             
-        # Get vertices from triangulation
+        face_normals = calculate_face_normals(face, triangulation, None)
+        
+        face_vertex_map = {}
+        
         for i in range(1, triangulation.NbNodes() + 1):
             node = triangulation.Node(i)
-            all_points.append((float(node.X()), float(node.Y()), float(node.Z())))
+            vertex = (float(node.X()), float(node.Y()), float(node.Z()))
+            
+            vertex_key = tuple(round(coord, 6) for coord in vertex)
+            
+            if vertex_key not in vertex_map:
+                vertex_map[vertex_key] = next_vertex_index
+                all_points.append(vertex)
+                next_vertex_index += 1
+            
+            face_vertex_map[i] = vertex_map[vertex_key]
         
-        # Get triangles from triangulation
+        normal_index = 0
         for i in range(1, triangulation.NbTriangles() + 1):
             triangle = triangulation.Triangle(i)
             n1, n2, n3 = triangle.Get()
-            # Convert to 0-based indexing and add vertex offset
-            all_face_vertex_counts.append(3)
-            all_face_vertex_indices.extend([
-                n1 - 1 + vertex_offset,
-                n2 - 1 + vertex_offset, 
-                n3 - 1 + vertex_offset
-            ])
-        
-        vertex_offset += triangulation.NbNodes()
+            
+            if n1 in face_vertex_map and n2 in face_vertex_map and n3 in face_vertex_map:
+                idx1, idx2, idx3 = face_vertex_map[n1], face_vertex_map[n2], face_vertex_map[n3]
+                if idx1 != idx2 and idx2 != idx3 and idx1 != idx3:
+                    all_face_vertex_counts.append(3)
+                    all_face_vertex_indices.extend([idx1, idx2, idx3])
+                    
+                    if normal_index * 3 + 2 < len(face_normals):
+                        all_normals.extend([
+                            face_normals[normal_index * 3],
+                            face_normals[normal_index * 3 + 1], 
+                            face_normals[normal_index * 3 + 2]
+                        ])
+                    else:
+                        default_normal = [0, 0, 1]
+                        all_normals.extend([default_normal, default_normal, default_normal])
+                    
+                    normal_index += 1
     
     if not all_points:
-        print(f"    ⚠️ Warning: No vertices found for shape {name}")
+        print(f"    Warning: No vertices found for shape {name}")
         return None
+
+    if FORCE_CONSISTENT_WINDING and all_normals:
+        all_face_vertex_indices, all_normals = ensure_consistent_winding_order(
+            all_points, all_face_vertex_indices, all_normals
+        )
     
-    print(f"    🏗️ Creating USD mesh with {len(all_points)} vertices, {len(all_face_vertex_counts)} triangles...")
-    # Create USD Mesh
     mesh_path = parent_prim.GetPath().AppendChild(name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
     
-    # Set mesh data
     mesh.CreatePointsAttr().Set(all_points)
     mesh.CreateFaceVertexCountsAttr().Set(all_face_vertex_counts)
     mesh.CreateFaceVertexIndicesAttr().Set(all_face_vertex_indices)
     
-    print(f"    ✅ Created mesh {name} with {len(all_points)} vertices and {len(all_face_vertex_counts)} faces")
+    if all_normals:
+        mesh.CreateNormalsAttr().Set(all_normals)
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+    
     return mesh
 

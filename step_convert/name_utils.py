@@ -56,11 +56,10 @@ def extract_product_names_from_step_file(step_file_path):
                 'description': description,
                 'entity_id': entity_id
             }
-            print(f"    🏭 Found STEP PRODUCT: '{name}' (ID: #{entity_id})")
         
-        print(f"📊 Extracted {len(product_names)} PRODUCT entries from STEP file")
+        print(f"Extracted {len(product_names)} PRODUCT entries from STEP file")
         return product_names
         
     except Exception as e:
-        print(f"⚠️ Warning: Could not extract PRODUCT names from STEP file: {e}")
+        print(f"Warning: Could not extract PRODUCT names from STEP file: {e}")
         return {}

@@ -1,9 +1,18 @@
 """Configuration settings for STEP to USD conversion."""
 
-# Mesh quality settings
-MESH_LINEAR_DEFLECTION = 0.5   # 5x coarser
-MESH_ANGULAR_DEFLECTION = 0.3  # 3x more angular
+# Mesh quality settings - balanced for good quality without over-triangulation
+MESH_LINEAR_DEFLECTION = 1.0   # Reasonable tessellation for most CAD models  
+MESH_ANGULAR_DEFLECTION = 0.5  # Good angular resolution without excessive triangles
 
-# Alternative higher quality settings (commented out)
+# Alternative settings for different quality needs:
+# High quality (slower, more triangles):
 # MESH_LINEAR_DEFLECTION = 0.1
 # MESH_ANGULAR_DEFLECTION = 0.1
+
+# Lower quality (faster, fewer triangles):
+# MESH_LINEAR_DEFLECTION = 2.0
+# MESH_ANGULAR_DEFLECTION = 1.0
+
+# Normal orientation settings
+FLIP_NORMALS = False  # Set to True if most faces appear inverted (inside-out)
+FORCE_CONSISTENT_WINDING = True  # Ensure consistent triangle winding order
