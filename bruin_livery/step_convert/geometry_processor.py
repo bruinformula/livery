@@ -52,6 +52,7 @@ def triangulate_shape(shape: TopoDS_Shape) -> None:
     #gmsh.model.occ.synchronize()
     
     # Fallback to OpenCASCADE triangulation
+
     mesh: BRepMesh_IncrementalMesh = BRepMesh_IncrementalMesh(shape, MESH_LINEAR_DEFLECTION, False, MESH_ANGULAR_DEFLECTION, True)
     mesh.Perform()
 
@@ -78,3 +79,4 @@ def apply_location_to_shape(shape: TopoDS_Shape, location: TopLoc_Location) -> T
     trsf: gp_Trsf = location.Transformation()
     transform_op: BRepBuilderAPI_Transform = BRepBuilderAPI_Transform(shape, trsf, True)
     return transform_op.Shape()
+

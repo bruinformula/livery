@@ -32,6 +32,7 @@ from pxr import Usd, UsdGeom, Gf, Sdf, Vt
 from .name_utils import sanitize_usd_name, generate_unique_name
 from .geometry_processor import triangulate_shape, extract_faces, apply_location_to_shape
 from .calculate_normals import calculate_face_normals, calculate_parametic_normals, ensure_consistent_winding_order
+from .edge_analysis import analyze_step_edges, generate_face_varying_normals
 from .step_reader import STEPFile, ComponentInfo
 
 # Type aliases for better readability
@@ -46,11 +47,13 @@ class ShapeToolProtocol(Protocol):
     pass
 
 try:
-    from .config import FORCE_CONSISTENT_WINDING
+    from .config import FORCE_CONSISTENT_WINDING, ENABLE_SHARP_EDGE_DETECTION, USE_FACE_VARYING_NORMALS
 except ImportError:
     # Default values if config not available
     FLIP_NORMALS: bool = False
     FORCE_CONSISTENT_WINDING: bool = True
+    ENABLE_SHARP_EDGE_DETECTION: bool = True
+    USE_FACE_VARYING_NORMALS: bool = True
 
 def convert_hierarchical_shape_to_usd(
     stage: Usd.Stage, 
@@ -155,7 +158,7 @@ def convert_shape_to_usd_mesh(
     shape: TopoDS_Shape, 
     name: str
 ) -> Optional[UsdGeom.Mesh]:
-    """Convert a triangulated shape to a USD Mesh.
+    """Convert a triangulated shape to a USD Mesh with optional sharp edge detection.
     
     Args:
         stage: USD stage
@@ -168,12 +171,109 @@ def convert_shape_to_usd_mesh(
     """
     
     triangulate_shape(shape)
-
     faces: List[FaceData] = extract_faces(shape)
     
     if not faces:
         print(f"    Warning: No triangulated faces found for shape {name}")
         return None
+    
+    # Analyze edges for sharp edge detection if enabled
+    sharp_edges = []
+    if ENABLE_SHARP_EDGE_DETECTION:
+        try:
+            print(f"    🔍 Analyzing edges for shape {name}...")
+            all_edges, sharp_edges = analyze_step_edges(shape)
+            print(f"    📊 Found {len(sharp_edges)} sharp edges out of {len(all_edges)} total")
+        except Exception as e:
+            print(f"    Warning: Sharp edge analysis failed for {name}: {e}")
+            sharp_edges = []
+    
+    # Generate mesh data with face-varying normals if sharp edges detected
+    if USE_FACE_VARYING_NORMALS and sharp_edges:
+        return _create_mesh_with_face_varying_normals(
+            stage, parent_prim, shape, name, faces, sharp_edges
+        )
+    else:
+        return _create_mesh_with_vertex_normals(
+            stage, parent_prim, shape, name, faces
+        )
+
+
+def _create_mesh_with_face_varying_normals(
+    stage: Usd.Stage,
+    parent_prim: UsdGeom.Xform,
+    shape: TopoDS_Shape,
+    name: str,
+    faces: List[FaceData],
+    sharp_edges: List[Any]
+) -> Optional[UsdGeom.Mesh]:
+    """Create USD mesh with face-varying normals for sharp edges."""
+    
+    try:
+        # Generate face-varying mesh data
+        all_normals, all_face_vertex_counts, all_face_vertex_indices = generate_face_varying_normals(
+            faces, sharp_edges
+        )
+        
+        # Build points list - for face-varying, each triangle gets unique vertices
+        all_points: List[Point3D] = []
+        vertex_index = 0
+        
+        for face, triangulation in faces:
+            if triangulation is None:
+                continue
+                
+            nb_triangles = triangulation.NbTriangles()
+            
+            for tri_idx in range(1, nb_triangles + 1):
+                triangle = triangulation.Triangle(tri_idx)
+                n1, n2, n3 = triangle.Get()
+                
+                # Get triangle vertices
+                p1 = triangulation.Node(n1)
+                p2 = triangulation.Node(n2)
+                p3 = triangulation.Node(n3)
+                
+                # Add unique points for this triangle (face-varying)
+                all_points.extend([
+                    (float(p1.X()), float(p1.Y()), float(p1.Z())),
+                    (float(p2.X()), float(p2.Y()), float(p2.Z())),
+                    (float(p3.X()), float(p3.Y()), float(p3.Z()))
+                ])
+        
+        if not all_points:
+            print(f"    Warning: No vertices generated for shape {name}")
+            return None
+        
+        # Create USD mesh
+        mesh_path: Sdf.Path = parent_prim.GetPath().AppendChild(name)
+        mesh: UsdGeom.Mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+        
+        # Set mesh attributes
+        mesh.CreatePointsAttr().Set(all_points)
+        mesh.CreateFaceVertexCountsAttr().Set(all_face_vertex_counts)
+        mesh.CreateFaceVertexIndicesAttr().Set(all_face_vertex_indices)
+        
+        if all_normals:
+            mesh.CreateNormalsAttr().Set(all_normals)
+            mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+        
+        print(f"    ✅ Created face-varying mesh: {len(all_points)} vertices, {len(all_face_vertex_counts)} faces")
+        return mesh
+        
+    except Exception as e:
+        print(f"    Warning: Face-varying mesh creation failed for {name}: {e}")
+        return None
+
+
+def _create_mesh_with_vertex_normals(
+    stage: Usd.Stage,
+    parent_prim: UsdGeom.Xform,
+    shape: TopoDS_Shape,
+    name: str,
+    faces: List[FaceData]
+) -> Optional[UsdGeom.Mesh]:
+    """Create USD mesh with traditional vertex normals (original implementation)."""
     
     all_points: List[Point3D] = []
     all_face_vertex_counts: List[int] = []
@@ -185,11 +285,8 @@ def convert_shape_to_usd_mesh(
     for face, triangulation in faces:
         if triangulation is None:
             continue
-                
-
-        face_normals: List[float] = calculate_face_normals(face, triangulation, None)
+        
         face_normals: List[float] = calculate_parametic_normals(face, triangulation, None)
-
         face_vertex_map: Dict[int, int] = {}
         
         for i in range(1, triangulation.NbNodes() + 1):

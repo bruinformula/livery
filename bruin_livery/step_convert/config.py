@@ -16,3 +16,8 @@ MESH_ANGULAR_DEFLECTION = 0.5  # Good angular resolution without excessive trian
 # Normal orientation settings
 FLIP_NORMALS = False  # Set to True if most faces appear inverted (inside-out)
 FORCE_CONSISTENT_WINDING = True  # Ensure consistent triangle winding order
+
+# Sharp edge detection settings
+ENABLE_SHARP_EDGE_DETECTION = True  # Enable analysis of surface derivatives for sharp edges
+SHARP_EDGE_ANGLE_THRESHOLD = 30.0  # degrees - edges with angle > this are considered sharp (lowered to catch more edges)
+USE_FACE_VARYING_NORMALS = True  # Use face-varying normals for sharp edges (creates harder edges)
