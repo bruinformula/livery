@@ -1,0 +1,15 @@
+car: 
+  model: {}
+  materials:
+    textures: {}
+    shaders: {}
+  rig: {}
+  livery:
+    test: {}
+  final: {}
+
+environments: {}
+
+template_scenes: {}
+
+scenes: {}

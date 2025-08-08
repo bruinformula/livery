@@ -1,44 +1,42 @@
-"""Utilities for name processing and validation."""
+"""Name utilities for STEP file processing."""
 
 import re
 import uuid
+from typing import Dict
+from .step_reader import ProductInfo
 
+# Global set to track used names and avoid duplicates
+_used_names = set()
 
 def sanitize_usd_name(name):
-    """Sanitize a name to be valid for USD prim names."""
+    """Convert a STEP name to a valid USD prim name."""
     if not name:
         return "unnamed"
     
     # Replace invalid characters with underscores
-    # USD names can only contain letters, numbers, and underscores
-    # and must start with a letter or underscore
-    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    sanitized = re.sub(r'[^\w]', '_', name)
     
-    # Ensure it starts with a letter or underscore
-    if sanitized and not (sanitized[0].isalpha() or sanitized[0] == '_'):
-        sanitized = 'P_' + sanitized
-    
-    # Remove multiple consecutive underscores
-    sanitized = re.sub(r'_+', '_', sanitized)
-    
-    # Remove trailing underscores
-    sanitized = sanitized.rstrip('_')
+    # Ensure it doesn't start with a digit
+    if sanitized and sanitized[0].isdigit():
+        sanitized = f"prim_{sanitized}"
     
     # Ensure it's not empty after sanitization
     if not sanitized:
-        return "unnamed"
+        sanitized = "unnamed"
     
     return sanitized
 
+def generate_unique_name():
+    """Generate a unique name for unnamed components."""
+    while True:
+        name = f"component_{uuid.uuid4().hex[:8]}"
+        if name not in _used_names:
+            _used_names.add(name)
+            return name
 
-def generate_unique_name(base_name="UnnamedShape"):
-    """Generate a unique name with UUID suffix."""
-    return f"{base_name}_{uuid.uuid4().hex[:8]}"
-
-
-def extract_product_names_from_step_file(step_file_path):
+def extract_product_names_from_step_file(step_file_path) -> Dict[str, ProductInfo]:
     """Extract PRODUCT names directly from STEP file text."""
-    product_names = {}
+    product_names: Dict[str, ProductInfo] = {}
     try:
         with open(step_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -51,11 +49,10 @@ def extract_product_names_from_step_file(step_file_path):
         
         for match in matches:
             name, description, entity_id = match
-            product_names[entity_id] = {
-                'name': name,
-                'description': description,
-                'entity_id': entity_id
-            }
+            product_names[entity_id] = ProductInfo(
+                name=name,
+                description=description if description else None
+            )
         
         print(f"Extracted {len(product_names)} PRODUCT entries from STEP file")
         return product_names
