@@ -99,22 +99,12 @@ def calculate_face_normals(
             else:
                 face_normal = np.array([0, 0, 1])
             
-            # Ensure normal points outward by comparing with surface normal if available
-            if face_surface_normal is not None:
-                # Calculate dot product to check direction
-                dot: float = np.dot(face_normal, face_surface_normal)
-                
-                # If dot product is negative, flip the normal
-                if dot < 0:
+            # Always flip normal if face orientation is reversed
+            try:
+                if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
                     face_normal = -face_normal
-            else:
-                # Fallback: Check face orientation from triangulation winding order
-                try:
-                    if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
-                        face_normal = -face_normal
-                except:
-                    pass  # Use face normal as-is if orientation check fails
-            
+            except Exception:
+                pass
             # Apply global normal flip if configured
             if FLIP_NORMALS:
                 face_normal = -face_normal
@@ -273,9 +263,12 @@ def calculate_parametic_normals(
                             else:
                                 normal = np.array([0, 0, 1], dtype=np.float64)
                             
-                            # Apply face orientation
-                            if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
-                                normal = -normal
+                            # Always flip normal if face orientation is reversed
+                            try:
+                                if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                                    normal = -normal
+                            except Exception:
+                                pass
                                 
                         else:
                             # Fallback: use geometric calculation

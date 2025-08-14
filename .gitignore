@@ -1,7 +1,5 @@
 /test_inputs/MK10.STEP
 /output/backup
-/output/**.usda
-/output/**.usd
-/output/**.usdc
+**.usda
 **/__pycache__
 **/.DS_Store

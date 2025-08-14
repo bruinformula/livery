@@ -17,7 +17,7 @@ Benefits:
 """
 
 from __future__ import annotations
-from typing import Any, MutableSet, Optional, List, Dict, Tuple, Union, Protocol
+from typing import Any, Optional, List, Dict, Tuple, Protocol
 
 from OCC.Core.TopoDS import TopoDS_Shape
 from OCC.Core.TopLoc import TopLoc_Location
@@ -27,11 +27,11 @@ from OCC.Core.gp import gp_Trsf, gp_Pnt
 from OCC.Core.Poly import Poly_Triangulation, Poly_Triangle
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_SOLID
-from pxr import Usd, UsdGeom, Gf, Sdf, Vt
+from pxr import Usd, UsdGeom, Gf, Sdf, Tf
 
 from .name_utils import sanitize_usd_name, generate_unique_name
-from .geometry_processor import triangulate_shape, extract_faces, apply_location_to_shape
-from .calculate_normals import calculate_face_normals, calculate_parametic_normals, ensure_consistent_winding_order
+from .geometry_processor import triangulate_shape, extract_faces
+from .calculate_normals import calculate_parametic_normals, ensure_consistent_winding_order
 from .edge_analysis import analyze_step_edges, generate_face_varying_normals
 from .step_reader import STEPFile, ComponentInfo
 
@@ -40,6 +40,16 @@ Point3D = Tuple[float, float, float]
 Normal3D = Tuple[float, float, float]
 FaceData = Tuple[TopoDS_Face, Optional[Poly_Triangulation]]
 VertexMap = Dict[Point3D, int]
+
+# Global registry for referencing system
+_geometry_registry: Dict[str, Sdf.Path] = {}
+_reference_counter: Dict[str, int] = {}
+
+def clear_geometry_registry():
+    """Clear the geometry registry for a new conversion."""
+    global _geometry_registry, _reference_counter
+    _geometry_registry.clear()
+    _reference_counter.clear()
 
 # Protocol for shape tool to provide better typing
 class ShapeToolProtocol(Protocol):
@@ -63,19 +73,22 @@ def convert_hierarchical_shape_to_usd(
     depth: int = 0, 
     accumulated_transform: Optional[TopLoc_Location] = None
 ) -> UsdGeom.Xform:
-    """Convert a hierarchical shape to USD, with proper transformation accumulation.
+    """Convert a hierarchical shape to USD, with proper transformation accumulation and USD references.
     
-        Args:
+    Args:
         stage: USD stage
         parent_prim: Parent USD prim 
         shape_info: ComponentInfo containing shape data and hierarchy
         shape_tool: XCAF shape tool for additional operations
         depth: Current depth in hierarchy for indentation
         accumulated_transform: Accumulated transformation from parent hierarchy
+        library_prim: Optional library scope for storing master geometries
         
     Returns:
         The created USD Xform prim
     """
+    
+    # No library layer: masters are created in-place at first occurrence
     
     indent: str = "  " * depth
     nauo_info: str = f" (NAUO: {shape_info.nauo_id})" if shape_info.nauo_id else ""
@@ -100,14 +113,14 @@ def convert_hierarchical_shape_to_usd(
     xform_path: Sdf.Path = parent_prim.GetPath().AppendChild(sanitized_name)
     xform: UsdGeom.Xform = UsdGeom.Xform.Define(stage, xform_path)
     
-    current_location: TopLoc_Location = shape_info.location
-    if accumulated_transform is None:
-        accumulated_transform: TopLoc_Location = TopLoc_Location()
-    
-    if current_location and not current_location.IsIdentity():
-        total_transform: TopLoc_Location = accumulated_transform * current_location
+    # Set transformation on this xform if we have a component location
+    if shape_info.location and not shape_info.location.IsIdentity():
+        transform_matrix = toploc_to_usd_matrix(shape_info.location)
+        xform.AddTransformOp().Set(transform_matrix)
+        print(f"{indent}TRANSFORM_DEBUG: Applied transform for {shape_info.name}")
+        print(f"{indent}TRANSFORM_DEBUG:   🔢 Transform matrix: {transform_matrix}")
     else:
-        total_transform: TopLoc_Location = accumulated_transform
+        print(f"{indent}No transform applied for {shape_info.name} (identity or missing)")
     
     prim: Usd.Prim = xform.GetPrim()
     if shape_info.nauo_id:
@@ -117,36 +130,76 @@ def convert_hierarchical_shape_to_usd(
     
     prim.SetDisplayName(shape_info.name)
     
+    # Handle leaf geometry nodes (parts with no children and containing solid geometry)
     if not shape_info.children and not shape_info.is_assembly:
-        shape: TopoDS_Shape = shape_info.shape
-        
-        if total_transform and not total_transform.IsIdentity():
-            shape: TopoDS_Shape = apply_location_to_shape(shape, total_transform)
-        
-        explorer: TopExp_Explorer = TopExp_Explorer(shape, TopAbs_SOLID)
-        if explorer.More():
-            mesh_base_name: str = shape_info.product_name or shape_info.name
-            mesh_name: str = f"{sanitize_usd_name(mesh_base_name)}_mesh"
-            try:
-                mesh_prim: Optional[UsdGeom.Mesh] = convert_shape_to_usd_mesh(stage, xform, shape, mesh_name)
-                if mesh_prim:
-                    # Get mesh statistics for display
-                    mesh_points: Optional[Any] = mesh_prim.GetPointsAttr().Get()
-                    mesh_face_counts: Optional[Any] = mesh_prim.GetFaceVertexCountsAttr().Get()
-                    vertex_count: int = len(mesh_points) if mesh_points else 0
-                    face_count: int = len(mesh_face_counts) if mesh_face_counts else 0
-                    print(f"{indent}Created: {mesh_name} with {vertex_count} vertices and {face_count} faces")
-            except Exception as e:
-                print(f"{indent}Warning: Failed to create mesh for {shape_info.name}: {e}")
+        # Check if this is a referenced geometry
+        referred_entry = shape_info.referred_entry
+
+        mesh_base_name: str = shape_info.product_name or shape_info.name
+        mesh_name: str = f"{sanitize_usd_name(mesh_base_name)}_mesh"
+
+        if referred_entry and referred_entry in _geometry_registry:
+            # This is an instance of existing geometry - create a reference as a child prim
+            master_path = _geometry_registry[referred_entry]
+            _reference_counter[referred_entry] += 1
+
+            print(f"{indent}Creating reference to {master_path} for {shape_info.name} (instance #{_reference_counter[referred_entry]})")
+            print(f"{indent}  🔗 Instance will inherit master geometry with own transform")
+
+            # Create a child prim under this xform and add a reference to the master mesh
+            ref_mesh_path = xform.GetPath().AppendChild(mesh_name)
+            ref_mesh_prim = UsdGeom.Mesh.Define(stage, ref_mesh_path)
+            ref_mesh_prim.GetPrim().GetReferences().AddInternalReference(master_path)
+
         else:
-            print(f"{indent}Part {shape_info.name} has no solid geometry (might be surface/wire)")
+            # This is the first occurrence - create the master geometry as a child of this xform
+            shape: TopoDS_Shape = shape_info.shape
+            explorer: TopExp_Explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+            if explorer.More():
+                if referred_entry:
+                    master_path = xform.GetPath().AppendChild(mesh_name)
+                    _geometry_registry[referred_entry] = master_path
+                    _reference_counter[referred_entry] = 1
+                    print(f"{indent}Creating master geometry at {master_path} for {shape_info.name}")
+                    print(f"{indent}  📍 Master will be created in-place at first occurrence")
+                    try:
+                        mesh_prim: Optional[UsdGeom.Mesh] = convert_shape_to_usd_mesh(stage, xform, shape, mesh_name)
+                        if mesh_prim:
+                            mesh_points: Optional[Any] = mesh_prim.GetPointsAttr().Get()
+                            mesh_face_counts: Optional[Any] = mesh_prim.GetFaceVertexCountsAttr().Get()
+                            vertex_count: int = len(mesh_points) if mesh_points else 0
+                            face_count: int = len(mesh_face_counts) if mesh_face_counts else 0
+                            print(f"{indent}Created master: {mesh_name} with {vertex_count} vertices and {face_count} faces")
+                    except Exception as e:
+                        print(f"{indent}Warning: Failed to create master mesh for {shape_info.name}: {e}")
+                else:
+                    # Single occurrence - create geometry directly
+                    try:
+                        mesh_prim: Optional[UsdGeom.Mesh] = convert_shape_to_usd_mesh(stage, xform, shape, mesh_name)
+                        if mesh_prim:
+                            mesh_points: Optional[Any] = mesh_prim.GetPointsAttr().Get()
+                            mesh_face_counts: Optional[Any] = mesh_prim.GetFaceVertexCountsAttr().Get()
+                            vertex_count: int = len(mesh_points) if mesh_points else 0
+                            face_count: int = len(mesh_face_counts) if mesh_face_counts else 0
+                            print(f"{indent}Created: {mesh_name} with {vertex_count} vertices and {face_count} faces")
+                    except Exception as e:
+                        print(f"{indent}Warning: Failed to create mesh for {shape_info.name}: {e}")
+            else:
+                print(f"{indent}Part {shape_info.name} has no solid geometry (might be surface/wire)")
     else:
         print(f"{indent}Processing: {shape_info.name}{nauo_info}{product_info}")
     
+    # Process children
     if shape_info.children:
         for i, child_info in enumerate(shape_info.children):
+            print(f"{indent}CHILD_RECURSE_DEBUG: Recursing into child {i} of {shape_info.name} at depth {depth+1}")
+            if shape_info.location and not shape_info.location.IsIdentity():
+                transform_matrix = toploc_to_usd_matrix(shape_info.location)
+                print(f"{indent}CHILD_RECURSE_DEBUG:   Parent transform matrix: {transform_matrix}")
+            else:
+                print(f"{indent}CHILD_RECURSE_DEBUG:   Parent transform is identity or missing")
             try:
-                convert_hierarchical_shape_to_usd(stage, xform, child_info, shape_tool, depth + 1, total_transform)
+                convert_hierarchical_shape_to_usd(stage, xform, child_info, shape_tool, depth + 1, accumulated_transform)
             except Exception as e:
                 print(f"{indent}  Warning: Failed to convert child {i} of {shape_info.name}: {e}")
     
@@ -245,19 +298,26 @@ def _create_mesh_with_face_varying_normals(
             print(f"    Warning: No vertices generated for shape {name}")
             return None
         
+        # Apply winding order correction if enabled
+        from .calculate_normals import ensure_consistent_winding_order
+        if FORCE_CONSISTENT_WINDING and all_normals:
+            all_face_vertex_indices, all_normals = ensure_consistent_winding_order(
+                all_points, all_face_vertex_indices, all_normals
+            )
+
         # Create USD mesh
         mesh_path: Sdf.Path = parent_prim.GetPath().AppendChild(name)
         mesh: UsdGeom.Mesh = UsdGeom.Mesh.Define(stage, mesh_path)
-        
+
         # Set mesh attributes
         mesh.CreatePointsAttr().Set(all_points)
         mesh.CreateFaceVertexCountsAttr().Set(all_face_vertex_counts)
         mesh.CreateFaceVertexIndicesAttr().Set(all_face_vertex_indices)
-        
+
         if all_normals:
             mesh.CreateNormalsAttr().Set(all_normals)
             mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
-        
+
         print(f"    ✅ Created face-varying mesh: {len(all_points)} vertices, {len(all_face_vertex_counts)} faces")
         return mesh
         
@@ -363,21 +423,18 @@ def gp_trsf_to_usd_matrix(trsf: gp_Trsf) -> Gf.Matrix4d:
     # USD expects row-major 4x4 matrix
     translation = trsf.TranslationPart()
     
-    # Build the 4x4 transformation matrix with proper float precision
-    # Row 0: [m11, m12, m13, tx]
-    # Row 1: [m21, m22, m23, ty] 
-    # Row 2: [m31, m32, m33, tz]
-    # Row 3: [0,   0,   0,   1]
     
     # Clean up very small values to avoid -0.0 display issues
     def clean_float(val: float) -> float:
         return 0.0 if abs(val) < 1e-10 else float(val)
     
+    #MUST LEAVE THE MATRIX TRANPOSED FUCK THIS SHIT
+
     return Gf.Matrix4d(
-        clean_float(trsf.Value(1, 1)), clean_float(trsf.Value(1, 2)), clean_float(trsf.Value(1, 3)), clean_float(translation.X()),
-        clean_float(trsf.Value(2, 1)), clean_float(trsf.Value(2, 2)), clean_float(trsf.Value(2, 3)), clean_float(translation.Y()),
-        clean_float(trsf.Value(3, 1)), clean_float(trsf.Value(3, 2)), clean_float(trsf.Value(3, 3)), clean_float(translation.Z()),
-        0.0, 0.0, 0.0, 1.0
+        clean_float(trsf.Value(1, 1)), clean_float(trsf.Value(2, 1)), clean_float(trsf.Value(3, 1)), 0.0,
+        clean_float(trsf.Value(1, 2)), clean_float(trsf.Value(2, 2)), clean_float(trsf.Value(3, 2)), 0.0,
+        clean_float(trsf.Value(1, 3)), clean_float(trsf.Value(2, 3)), clean_float(trsf.Value(3, 3)), 0.0,
+        clean_float(translation.X()),  clean_float(translation.Y()),  clean_float(translation.Z()), 1.0
     )
 
 def toploc_to_usd_matrix(location: TopLoc_Location) -> Gf.Matrix4d:

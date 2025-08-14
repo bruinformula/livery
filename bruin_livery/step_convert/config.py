@@ -1,8 +1,8 @@
 """Configuration settings for STEP to USD conversion."""
 
 # Mesh quality settings - balanced for good quality without over-triangulation
-MESH_LINEAR_DEFLECTION = 1.0   # Reasonable tessellation for most CAD models  
-MESH_ANGULAR_DEFLECTION = 0.5  # Good angular resolution without excessive triangles
+MESH_LINEAR_DEFLECTION = 1.25   # Reasonable tessellation for most CAD models  
+MESH_ANGULAR_DEFLECTION = 0.25  # Good angular resolution without excessive triangles
 
 # Alternative settings for different quality needs:
 # High quality (slower, more triangles):
@@ -19,5 +19,4 @@ FORCE_CONSISTENT_WINDING = True  # Ensure consistent triangle winding order
 
 # Sharp edge detection settings
 ENABLE_SHARP_EDGE_DETECTION = True  # Enable analysis of surface derivatives for sharp edges
-SHARP_EDGE_ANGLE_THRESHOLD = 30.0  # degrees - edges with angle > this are considered sharp (lowered to catch more edges)
 USE_FACE_VARYING_NORMALS = True  # Use face-varying normals for sharp edges (creates harder edges)

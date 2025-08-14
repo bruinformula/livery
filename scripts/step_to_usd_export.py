@@ -29,7 +29,7 @@ def setup_config(args):
     
     if args.flip_normals:
         print("normal")
-        #config.FLIP_NORMALS = args.flip_normals
+        config.FLIP_NORMALS = args.flip_normals
     
     if args.force_winding:
         print("force")

@@ -10,7 +10,9 @@ from pxr import Usd, UsdGeom
 
 from .name_utils import extract_product_names_from_step_file
 from .step_reader import STEPFile
-from .usd_converter import convert_hierarchical_shape_to_usd
+from .usd_converter import convert_hierarchical_shape_to_usd, clear_geometry_registry
+from .usd_converter import _reference_counter
+
 
 def convert_step_to_usd(step_path=None, usd_path=None):
         
@@ -48,13 +50,16 @@ def convert_step_to_usd(step_path=None, usd_path=None):
     stage = Usd.Stage.CreateNew(usd_path)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
 
+    # Clear geometry registry for new conversion
+    clear_geometry_registry()
+
     # Root Xform
-    root = UsdGeom.Xform.Define(stage, "/Root")
+    root = UsdGeom.Xform.Define(stage, "/")
     print("✅ USD stage initialized")
     print()
 
     # Convert hierarchical shapes
-    print("🔄 Converting shapes to USD...")
+    print("🔄 Converting shapes to USD with reference detection...")
     print("-" * 40)
     total_shapes = 0
 
@@ -79,4 +84,12 @@ def convert_step_to_usd(step_path=None, usd_path=None):
     print(f"📁 USD file saved: {usd_path}")
     print(f"📊 Total shapes exported: {total_shapes}")
     print(f"🏗️ Hierarchy preserved: ✅")
+    
+    # Print reference statistics
+    if _reference_counter:
+        print(f"🔗 USD References created:")
+        for referred_entry, count in _reference_counter.items():
+            if count > 1:
+                print(f"    {referred_entry}: {count} instances")
+    
     print("=" * 60)

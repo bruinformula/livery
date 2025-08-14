@@ -13,7 +13,7 @@ from numpy.typing import NDArray
 
 from OCC.Core.TopoDS import TopoDS_Shape, TopoDS_Face, TopoDS_Edge
 from OCC.Core.TopExp import TopExp_Explorer, topexp
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_Orientation
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
 from OCC.Core.GeomLProp import GeomLProp_SLProps, GeomLProp_CLProps
@@ -30,9 +30,8 @@ except ImportError:
     MESH_LINEAR_DEFLECTION = 1.0
 
 # Configuration for sharp edge detection
-SHARP_EDGE_ANGLE_THRESHOLD = 30.0  # degrees - edges with angle > this are considered sharp
-MIN_EDGE_LENGTH = 0.1  # minimum edge length to consider for sharp edge detection
-DERIVATIVE_TOLERANCE = 1e-6  # tolerance for surface derivative comparison
+DERIVATIVE_DISCONTINUITY_THRESHOLD = 0.1  # degrees - minimal threshold for numerical precision only
+DERIVATIVE_TOLERANCE = 1e-3  # tolerance for numerical precision in calculations
 
 
 class EdgeInfo:
@@ -84,19 +83,16 @@ class SharpEdgeDetector:
                 edge_info.angle = self._calculate_dihedral_angle(edge, face1, face2)
                 angle_samples.append(edge_info.angle)
                 
-                # Check surface derivatives
+                # Check surface derivatives - this is the real test for sharp edges
                 edge_info.derivatives_differ = self._check_surface_derivatives(edge, face1, face2)
                 
-                # Determine if edge is sharp
-                edge_info.is_sharp = (
-                    edge_info.angle > SHARP_EDGE_ANGLE_THRESHOLD or 
-                    edge_info.derivatives_differ
-                )
+                # Determine if edge is sharp based purely on derivative discontinuity
+                edge_info.is_sharp = edge_info.derivatives_differ
                 
                 if edge_info.is_sharp:
                     self.sharp_edges.append(edge_info)
                     sharp_count += 1
-                    print(f"  🔪 Sharp edge detected: {edge_info.angle:.1f}° (threshold: {SHARP_EDGE_ANGLE_THRESHOLD}°)")
+                    print(f"  🔪 Sharp edge detected: derivative discontinuity at edge")
                 
                 all_edges.append(edge_info)
         
@@ -131,6 +127,9 @@ class SharpEdgeDetector:
     def _calculate_dihedral_angle(self, edge: TopoDS_Edge, face1: TopoDS_Face, face2: TopoDS_Face) -> float:
         """Calculate the dihedral angle between two faces along their shared edge.
         
+        This method properly handles curved surfaces by calculating normals at points
+        near the actual edge rather than using face centers.
+        
         Args:
             edge: The shared edge
             face1: First face
@@ -140,89 +139,49 @@ class SharpEdgeDetector:
             Dihedral angle in degrees (0-180)
         """
         try:
-            # Use BRepLProp for more direct surface property calculation
-            surface1 = BRep_Tool.Surface(face1)
-            surface2 = BRep_Tool.Surface(face2)
-            
-            if surface1 is None or surface2 is None:
-                return 0.0
-            
             # Get edge curve
-            edge_curve = BRep_Tool.Curve(edge)[0]
+            edge_curve, first_param, last_param = BRep_Tool.Curve(edge)
             if edge_curve is None:
-                return 0.0
+                return 180.0  # Assume flat if no curve data
                 
-            # Get parameter range
-            first_param = BRep_Tool.Curve(edge)[1]
-            last_param = BRep_Tool.Curve(edge)[2]
+            # Sample at the middle of the edge for most representative result
             mid_param = (first_param + last_param) / 2.0
             
             # Get point on edge
             edge_point = gp_Pnt()
             edge_curve.D0(mid_param, edge_point)
             
-            # Try to get UV parameters for this point on each face
-            # This is a simplified approach - projecting to face centers with offset
+            # Get precise normals from both faces at this edge point
+            normal1 = self._get_precise_surface_normal_at_edge(face1, edge_point)
+            normal2 = self._get_precise_surface_normal_at_edge(face2, edge_point)
             
-            # Get face 1 properties
-            face1_adaptor = BRepAdaptor_Surface(face1)
-            u1_mid = (face1_adaptor.FirstUParameter() + face1_adaptor.LastUParameter()) / 2.0
-            v1_mid = (face1_adaptor.FirstVParameter() + face1_adaptor.LastVParameter()) / 2.0
+            if normal1 is None or normal2 is None:
+                return 180.0  # Assume flat if normal calculation fails
             
-            # Get face 2 properties
-            face2_adaptor = BRepAdaptor_Surface(face2)
-            u2_mid = (face2_adaptor.FirstUParameter() + face2_adaptor.LastUParameter()) / 2.0
-            v2_mid = (face2_adaptor.FirstVParameter() + face2_adaptor.LastVParameter()) / 2.0
+            # Calculate dihedral angle between faces
+            # The dihedral angle is the angle between the two face normals
+            dot_product = np.clip(np.dot(normal1, normal2), -1.0, 1.0)
             
-            # Calculate normals using surface properties  
-            props1 = BRepLProp_SLProps(face1_adaptor, u1_mid, v1_mid, 1, 1e-6)
-            props2 = BRepLProp_SLProps(face2_adaptor, u2_mid, v2_mid, 1, 1e-6)
-            
-            if not props1.IsNormalDefined() or not props2.IsNormalDefined():
-                return 0.0
-            
-            # Get normal vectors
-            normal1 = props1.Normal()
-            normal2 = props2.Normal()
-            
-            # Convert to numpy arrays
-            n1 = np.array([normal1.X(), normal1.Y(), normal1.Z()])
-            n2 = np.array([normal2.X(), normal2.Y(), normal2.Z()])
-            
-            # Normalize
-            n1_len = np.linalg.norm(n1)
-            n2_len = np.linalg.norm(n2)
-            
-            if n1_len < 1e-10 or n2_len < 1e-10:
-                return 0.0
-                
-            n1 = n1 / n1_len
-            n2 = n2 / n2_len
-            
-            # Calculate angle between normals
-            dot_product = np.clip(np.dot(n1, n2), -1.0, 1.0)
+            # Calculate angle between normals (0° to 180°)
             angle_rad = np.arccos(abs(dot_product))
             angle_deg = np.degrees(angle_rad)
             
-            # The dihedral angle is the angle between the planes
-            # For two planes with normals n1 and n2, the dihedral angle is:
-            # - 0° if they're coplanar (normals parallel, same direction)
-            # - 180° if they're coplanar (normals parallel, opposite direction)  
-            # - 90° if they're perpendicular
+            # For dihedral angles:
+            # - Smooth surfaces: normals are nearly parallel, angle ≈ 0°, dihedral ≈ 180°
+            # - Sharp edges: normals are at an angle, dihedral < 180°
             
-            # If normals point in same direction (dot > 0), faces are on same side - small dihedral
-            # If normals point in opposite directions (dot < 0), faces are on opposite sides - large dihedral
-            
-            if dot_product >= 0:
-                # Normals point in similar directions - acute dihedral angle
-                return angle_deg
+            if dot_product > 0:
+                # Normals point in similar direction (smooth transition)
+                dihedral_angle = 180.0 - angle_deg
             else:
-                # Normals point in opposite directions - obtuse dihedral angle
-                return 180.0 - angle_deg
+                # Normals point in different directions (potential discontinuity)
+                dihedral_angle = 180.0 - angle_deg
+            
+            return max(0.0, min(180.0, dihedral_angle))  # Clamp to valid range
                 
         except Exception as e:
             print(f"    Warning: Dihedral angle calculation failed: {e}")
-            return 0.0
+            return 180.0  # Assume flat if calculation fails
     
     def _get_face_normal_near_edge(self, face: TopoDS_Face, edge: TopoDS_Edge, edge_point: gp_Pnt) -> Optional[NDArray[np.float64]]:
         """Get the surface normal of a face near an edge point.
@@ -331,10 +290,11 @@ class SharpEdgeDetector:
             return None
     
     def _check_surface_derivatives(self, edge: TopoDS_Edge, face1: TopoDS_Face, face2: TopoDS_Face) -> bool:
-        """Check if surface derivatives differ significantly across an edge.
+        """Check if surface derivatives differ across an edge using proper geometric continuity.
         
-        This analyzes the first and second derivatives of the surfaces on either
-        side of the edge to detect discontinuities that should result in sharp edges.
+        This method evaluates actual surface derivatives (tangent vectors) at the edge
+        to determine if there's a true geometric discontinuity. For curved surfaces
+        like cylinders, the normals should be continuous even though they change direction.
         
         Args:
             edge: The shared edge
@@ -342,44 +302,425 @@ class SharpEdgeDetector:
             face2: Second face
             
         Returns:
-            True if derivatives differ significantly
+            True if surface has derivative discontinuity (sharp edge)
         """
         try:
-            # Get adaptors for both faces
-            adaptor1 = BRepAdaptor_Surface(face1)
-            adaptor2 = BRepAdaptor_Surface(face2)
+            # Get edge curve and sample points along it
+            edge_curve, first_param, last_param = BRep_Tool.Curve(edge)
+            if edge_curve is None:
+                print("    ✅ Smooth edge: no curve data available")
+                return False
             
-            # Sample derivatives along the edge
-            edge_adaptor = BRepAdaptor_Curve(edge)
-            u_start = edge_adaptor.FirstParameter()
-            u_end = edge_adaptor.LastParameter()
+            # Sample multiple points along the edge for robust analysis
+            test_params = [
+                first_param + 0.2 * (last_param - first_param),
+                first_param + 0.5 * (last_param - first_param),
+                first_param + 0.8 * (last_param - first_param)
+            ]
             
-            # Sample at multiple points along edge
-            sample_points = 3
-            derivative_differences = []
+            discontinuity_scores = []
             
-            for i in range(sample_points):
-                if sample_points == 1:
-                    t = (u_start + u_end) / 2.0
-                else:
-                    t = u_start + (u_end - u_start) * i / (sample_points - 1)
-                
-                edge_point = edge_adaptor.Value(t)
-                
-                # Get derivatives from both faces (simplified - using face centers)
-                deriv_diff = self._compare_derivatives_at_point(adaptor1, adaptor2, edge_point)
-                if deriv_diff is not None:
-                    derivative_differences.append(deriv_diff)
+            for param in test_params:
+                try:
+                    # Get point on edge
+                    edge_point = gp_Pnt()
+                    edge_curve.D0(param, edge_point)
+                    
+                    # Get surface derivatives from both faces at this edge point
+                    derivatives1 = self._get_surface_derivatives_at_edge(face1, edge_point)
+                    derivatives2 = self._get_surface_derivatives_at_edge(face2, edge_point)
+                    
+                    if derivatives1 is not None and derivatives2 is not None:
+                        # Compare both first derivatives (tangent vectors)
+                        normal1, du1, dv1 = derivatives1
+                        normal2, du2, dv2 = derivatives2
+                        
+                        # For geometric continuity, check if the normals and tangent vectors align
+                        # across the edge boundary. Small differences are expected for numerical precision.
+                        
+                        # Normal continuity check
+                        normal_angle = self._angle_between_vectors(normal1, normal2)
+                        
+                        # Tangent continuity check - project tangents onto common plane
+                        tangent_discontinuity = self._check_tangent_continuity(
+                            du1, dv1, du2, dv2, normal1, normal2
+                        )
+                        
+                        # Combine both checks for a continuity score
+                        continuity_score = max(normal_angle, tangent_discontinuity)
+                        discontinuity_scores.append(continuity_score)
+                        
+                except Exception as e:
+                    print(f"    Warning: Derivative calculation failed at param {param}: {e}")
+                    continue
             
-            if derivative_differences:
-                avg_diff = np.mean(derivative_differences)
-                return avg_diff > DERIVATIVE_TOLERANCE
+            if not discontinuity_scores:
+                print("    ✅ Smooth edge: could not analyze derivatives, assuming smooth")
+                return False
             
-            return False
+            # Use the maximum discontinuity score across all sample points
+            max_discontinuity = max(discontinuity_scores)
+            
+            # Pure derivative discontinuity detection - no angle threshold
+            # If derivatives differ at all, it's a sharp edge
+            DERIVATIVE_DISCONTINUITY_THRESHOLD = 0.1  # Very small threshold for numerical precision only
+            
+            is_discontinuous = max_discontinuity > DERIVATIVE_DISCONTINUITY_THRESHOLD
+            
+            return is_discontinuous
             
         except Exception as e:
-            print(f"Warning: Could not check surface derivatives: {e}")
-            return False
+            print(f"    Warning: Could not check derivatives: {e}")
+            print("    ✅ Smooth edge: assuming smooth due to analysis failure")
+            return False  # Assume smooth if analysis fails
+    
+    def _get_surface_derivatives_at_edge(self, face: TopoDS_Face, edge_point: gp_Pnt) -> Optional[Tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]]:
+        """Get surface derivatives (normal and tangent vectors) at an edge point.
+        
+        Args:
+            face: The face to analyze
+            edge_point: Point on the edge
+            
+        Returns:
+            Tuple of (normal, du_tangent, dv_tangent) vectors, or None if calculation fails
+        """
+        try:
+            adaptor = BRepAdaptor_Surface(face)
+            
+            # Project the edge point onto the surface to get accurate UV coordinates
+            from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnSurf
+            
+            # Get the underlying geometric surface
+            geom_surface = BRep_Tool.Surface(face)
+            if geom_surface is None:
+                return None
+            
+            # Project point onto surface
+            projector = GeomAPI_ProjectPointOnSurf(edge_point, geom_surface)
+            
+            if projector.NbPoints() > 0:
+                # Get UV parameters of the closest point
+                u, v = projector.Parameters(1)
+                
+                # Calculate surface derivatives (normal and tangent vectors)
+                props = GeomLProp_SLProps(geom_surface, u, v, 2, 1e-6)  # 2nd order for curvature
+                
+                if props.IsNormalDefined():
+                    # Get normal vector
+                    normal = props.Normal()
+                    normal_array = np.array([normal.X(), normal.Y(), normal.Z()])
+                    
+                    # Handle face orientation
+                    if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                        normal_array = -normal_array
+                    
+                    # Normalize normal
+                    normal_length = np.linalg.norm(normal_array)
+                    if normal_length > 1e-10:
+                        normal_array = normal_array / normal_length
+                    else:
+                        return None
+                    
+                    # Get first derivatives (tangent vectors)
+                    du = gp_Vec()
+                    dv = gp_Vec()
+                    
+                    try:
+                        props.D1U(du)
+                        props.D1V(dv)
+                        
+                        du_array = np.array([du.X(), du.Y(), du.Z()])
+                        dv_array = np.array([dv.X(), dv.Y(), dv.Z()])
+                        
+                        # Normalize tangent vectors
+                        du_length = np.linalg.norm(du_array)
+                        dv_length = np.linalg.norm(dv_array)
+                        
+                        if du_length > 1e-10:
+                            du_array = du_array / du_length
+                        if dv_length > 1e-10:
+                            dv_array = dv_array / dv_length
+                        
+                        return normal_array, du_array, dv_array
+                    except Exception:
+                        # If derivatives aren't available, return just the normal
+                        return normal_array, np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+            
+            # Fallback: use face center if projection fails
+            u_mid = (adaptor.FirstUParameter() + adaptor.LastUParameter()) / 2.0
+            v_mid = (adaptor.FirstVParameter() + adaptor.LastVParameter()) / 2.0
+            
+            props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 2, 1e-6)
+            if props.IsNormalDefined():
+                normal = props.Normal()
+                normal_array = np.array([normal.X(), normal.Y(), normal.Z()])
+                
+                # Handle face orientation
+                if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                    normal_array = -normal_array
+                
+                normal_length = np.linalg.norm(normal_array)
+                if normal_length > 1e-10:
+                    normal_array = normal_array / normal_length
+                    
+                    # Get derivatives if available
+                    du = gp_Vec()
+                    dv = gp_Vec()
+                    
+                    try:
+                        props.D1U(du)
+                        props.D1V(dv)
+                        
+                        du_array = np.array([du.X(), du.Y(), du.Z()])
+                        dv_array = np.array([dv.X(), dv.Y(), dv.Z()])
+                        
+                        du_length = np.linalg.norm(du_array)
+                        dv_length = np.linalg.norm(dv_array)
+                        
+                        if du_length > 1e-10:
+                            du_array = du_array / du_length
+                        if dv_length > 1e-10:
+                            dv_array = dv_array / dv_length
+                        
+                        return normal_array, du_array, dv_array
+                    except Exception:
+                        # If derivatives aren't available, return just the normal with default tangents
+                        return normal_array, np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+            
+            return None
+            
+        except Exception as e:
+            print(f"    Warning: Surface derivative calculation failed: {e}")
+            return None
+    
+    def _angle_between_vectors(self, v1: NDArray[np.float64], v2: NDArray[np.float64]) -> float:
+        """Calculate angle between two vectors in degrees.
+        
+        Args:
+            v1: First vector
+            v2: Second vector
+            
+        Returns:
+            Angle in degrees (0-180)
+        """
+        try:
+            # Ensure vectors are normalized
+            v1_norm = v1 / np.linalg.norm(v1) if np.linalg.norm(v1) > 1e-10 else v1
+            v2_norm = v2 / np.linalg.norm(v2) if np.linalg.norm(v2) > 1e-10 else v2
+            
+            # Calculate dot product and clamp to valid range
+            dot_product = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+            
+            # Calculate angle in radians then convert to degrees
+            angle_rad = np.arccos(abs(dot_product))
+            angle_deg = np.degrees(angle_rad)
+            
+            return angle_deg
+            
+        except Exception:
+            return 0.0
+    
+    def _check_tangent_continuity(self, du1: NDArray[np.float64], dv1: NDArray[np.float64], 
+                                du2: NDArray[np.float64], dv2: NDArray[np.float64],
+                                normal1: NDArray[np.float64], normal2: NDArray[np.float64]) -> float:
+        """Check continuity of tangent vectors across a surface boundary.
+        
+        For surfaces to be geometrically continuous (G1), the tangent vectors
+        should align properly across the boundary.
+        
+        Args:
+            du1, dv1: Tangent vectors for first surface
+            du2, dv2: Tangent vectors for second surface  
+            normal1, normal2: Normal vectors for both surfaces
+            
+        Returns:
+            Discontinuity measure in degrees (0 = continuous)
+        """
+        try:
+            # For curved surfaces like cylinders, the tangent spaces should align
+            # We check if the tangent vectors from one surface can be expressed
+            # as linear combinations of the tangent vectors from the other surface
+            
+            # Calculate the angle between tangent planes
+            # The tangent plane is spanned by the du and dv vectors
+            
+            # Normal to tangent plane 1 (should be same as surface normal)
+            plane_normal1 = np.cross(du1, dv1)
+            plane_normal1_length = np.linalg.norm(plane_normal1)
+            if plane_normal1_length > 1e-10:
+                plane_normal1 = plane_normal1 / plane_normal1_length
+            
+            # Normal to tangent plane 2
+            plane_normal2 = np.cross(du2, dv2)
+            plane_normal2_length = np.linalg.norm(plane_normal2)
+            if plane_normal2_length > 1e-10:
+                plane_normal2 = plane_normal2 / plane_normal2_length
+            
+            # The angle between the tangent planes indicates continuity
+            plane_angle = self._angle_between_vectors(plane_normal1, plane_normal2)
+            
+            # Also check individual tangent vector alignment
+            # Project tangent vectors onto a common reference frame
+            
+            # Find the primary tangent directions
+            du1_magnitude = np.linalg.norm(du1)
+            dv1_magnitude = np.linalg.norm(dv1)
+            du2_magnitude = np.linalg.norm(du2)
+            dv2_magnitude = np.linalg.norm(dv2)
+            
+            # Use the dominant tangent direction for comparison
+            primary_tangent1 = du1 if du1_magnitude > dv1_magnitude else dv1
+            primary_tangent2 = du2 if du2_magnitude > dv2_magnitude else dv2
+            
+            tangent_angle = self._angle_between_vectors(primary_tangent1, primary_tangent2)
+            
+            # Return the maximum discontinuity
+            return max(plane_angle, tangent_angle)
+            
+        except Exception:
+            return 0.0  # Assume continuous if calculation fails
+
+    def _get_precise_surface_normal_at_edge(self, face: TopoDS_Face, edge_point: gp_Pnt) -> Optional[NDArray[np.float64]]:
+        """Get precise surface normal near an edge point using projection.
+        
+        This is a simplified version that extracts just the normal from the full derivative calculation.
+        
+        Args:
+            face: The face to analyze
+            edge_point: Point on the edge
+            
+        Returns:
+            Unit normal vector as numpy array, or None if calculation fails
+        """
+        derivatives = self._get_surface_derivatives_at_edge(face, edge_point)
+        if derivatives is not None:
+            normal, _, _ = derivatives
+            return normal
+        return None
+        """Get precise surface normal near an edge point using projection.
+        
+        Args:
+            face: The face to analyze
+            edge_point: Point on the edge
+            
+        Returns:
+            Unit normal vector as numpy array, or None if calculation fails
+        """
+        try:
+            adaptor = BRepAdaptor_Surface(face)
+            
+            # Project the edge point onto the surface to get accurate UV coordinates
+            # This is more accurate than sampling a grid
+            from OCC.Core.GeomAPI import GeomAPI_ProjectPointOnSurf
+            from OCC.Core.GeomAdaptor import GeomAdaptor_Surface
+            
+            # Get the underlying geometric surface
+            geom_surface = BRep_Tool.Surface(face)
+            if geom_surface is None:
+                return None
+            
+            # Project point onto surface
+            projector = GeomAPI_ProjectPointOnSurf(edge_point, geom_surface)
+            
+            if projector.NbPoints() > 0:
+                # Get UV parameters of the closest point
+                u, v = projector.Parameters(1)
+                
+                # Calculate surface normal at these UV coordinates
+                props = GeomLProp_SLProps(geom_surface, u, v, 1, 1e-6)
+                
+                if props.IsNormalDefined():
+                    normal = props.Normal()
+                    normal_array = np.array([normal.X(), normal.Y(), normal.Z()])
+                    
+                    # Handle face orientation
+                    if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                        normal_array = -normal_array
+                    
+                    # Normalize
+                    length = np.linalg.norm(normal_array)
+                    if length > 1e-10:
+                        return normal_array / length
+            
+            # Fallback: use face center if projection fails
+            u_mid = (adaptor.FirstUParameter() + adaptor.LastUParameter()) / 2.0
+            v_mid = (adaptor.FirstVParameter() + adaptor.LastVParameter()) / 2.0
+            
+            props = BRepLProp_SLProps(adaptor, u_mid, v_mid, 1, 1e-6)
+            if props.IsNormalDefined():
+                normal = props.Normal()
+                normal_array = np.array([normal.X(), normal.Y(), normal.Z()])
+                
+                # Handle face orientation
+                if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                    normal_array = -normal_array
+                
+                length = np.linalg.norm(normal_array)
+                if length > 1e-10:
+                    return normal_array / length
+            
+            return None
+            
+        except Exception:
+            return None
+    
+    def _get_surface_normal_near_edge(self, face: TopoDS_Face, adaptor: BRepAdaptor_Surface, edge_point: gp_Pnt) -> Optional[NDArray[np.float64]]:
+        """Get surface normal near an edge point by sampling the face surface.
+        
+        Args:
+            face: The face to analyze
+            adaptor: Surface adaptor for the face
+            edge_point: Point on the edge
+            
+        Returns:
+            Unit normal vector or None if calculation fails
+        """
+        try:
+            # Sample UV parameters near the face center
+            # For a proper implementation, we'd project the edge_point onto the surface
+            # Here we use a simplified approach with small offsets from center
+            u_min = adaptor.FirstUParameter()
+            u_max = adaptor.LastUParameter()
+            v_min = adaptor.FirstVParameter()
+            v_max = adaptor.LastVParameter()
+            
+            u_center = (u_min + u_max) / 2.0
+            v_center = (v_min + v_max) / 2.0
+            
+            # Try multiple sample points to find one that works
+            test_points = [
+                (u_center, v_center),                           # Center
+                (u_center + (u_max - u_min) * 0.1, v_center),   # Slight offset
+                (u_center, v_center + (v_max - v_min) * 0.1),   # Slight offset
+                (u_center - (u_max - u_min) * 0.1, v_center),   # Opposite offset
+                (u_center, v_center - (v_max - v_min) * 0.1),   # Opposite offset
+            ]
+            
+            for u_test, v_test in test_points:
+                try:
+                    # Ensure UV parameters are within bounds
+                    u_clamped = max(u_min, min(u_max, u_test))
+                    v_clamped = max(v_min, min(v_max, v_test))
+                    
+                    # Calculate surface properties
+                    props = BRepLProp_SLProps(adaptor, u_clamped, v_clamped, 1, 1e-6)
+                    
+                    if props.IsNormalDefined():
+                        normal = props.Normal()
+                        normal_array = np.array([normal.X(), normal.Y(), normal.Z()])
+                        
+                        # Normalize
+                        length = np.linalg.norm(normal_array)
+                        if length > 1e-10:
+                            return normal_array / length
+                
+                except Exception:
+                    continue
+            
+            return None
+            
+        except Exception:
+            return None
     
     def _compare_derivatives_at_point(self, adaptor1: BRepAdaptor_Surface, 
                                     adaptor2: BRepAdaptor_Surface, 
@@ -472,28 +813,36 @@ def generate_face_varying_normals(
         
         face_normals = calculate_parametic_normals(face, triangulation, None)
         
+        # Flip normals if face orientation is reversed
+        try:
+            from OCC.Core.TopAbs import TopAbs_Orientation
+            #if face.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+                #face_normals = [[-n[0], -n[1], -n[2]] for n in face_normals]
+        except Exception:
+            pass
+
         # Create face-varying vertices - each triangle gets its own vertex indices
         nb_triangles = triangulation.NbTriangles()
-        
+
         for tri_idx in range(1, nb_triangles + 1):
             triangle = triangulation.Triangle(tri_idx)
             n1, n2, n3 = triangle.Get()
-            
+
             # Get the triangle's vertices
             p1 = triangulation.Node(n1)
-            p2 = triangulation.Node(n2) 
+            p2 = triangulation.Node(n2)
             p3 = triangulation.Node(n3)
-            
+
             # For face-varying, each triangle gets unique vertex indices
             idx1 = vertex_counter
             idx2 = vertex_counter + 1
             idx3 = vertex_counter + 2
             vertex_counter += 3
-            
+
             # Add triangle to mesh
             all_face_vertex_counts.append(3)
             all_face_vertex_indices.extend([idx1, idx2, idx3])
-            
+
             # Add normals - use face normals for this triangle
             normal_base_idx = (tri_idx - 1) * 3
             if normal_base_idx + 2 < len(face_normals):
@@ -507,7 +856,7 @@ def generate_face_varying_normals(
                 default_normal = [0.0, 0.0, 1.0]
                 all_normals.extend([default_normal, default_normal, default_normal])
     
-    print(f"✅ Generated {len(all_normals)} face-varying normals for {len(all_face_vertex_counts)} triangles")
+    #print(f"✅ Generated {len(all_normals)} face-varying normals for {len(all_face_vertex_counts)} triangles")
     
     return all_normals, all_face_vertex_counts, all_face_vertex_indices
 
