@@ -13,6 +13,7 @@ from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.TCollection import TCollection_AsciiString
 from OCC.Core.TDF import TDF_Label
 from OCC.Core.TopoDS import TopoDS_Shape
+from OCC.Core.STEPConstruct import STEPConstruct_Units
 
 
 @dataclass
@@ -54,9 +55,11 @@ class STEPFile:
     hierarchy: List[ComponentInfo]
     shape_tool: Any  # XCAFDoc_ShapeTool 
     color_tool: Any  # XCAFDoc_ColorTool
+    units: str  # STEP file units (mm, m, in, etc.)
+    unit_scale_factor: float  # Scale factor to convert to mm
 
     def __init__(self, step_file_path: Union[str, Path], step_product_names: Optional[ProductDict] = None):
-        hierarchy, shape_tool, color_tool = STEPFile.read_step_file_with_hierarchy(step_file_path, step_product_names)
+        hierarchy, shape_tool, color_tool, units, unit_scale_factor = STEPFile.read_step_file_with_hierarchy(step_file_path, step_product_names)
 
         if not hierarchy:
             raise ValueError("No shapes found in STEP file")
@@ -64,6 +67,8 @@ class STEPFile:
         self.hierarchy = hierarchy
         self.shape_tool = shape_tool
         self.color_tool = color_tool
+        self.units = units
+        self.unit_scale_factor = unit_scale_factor
 
 
     def print_component_metadata_report(self, depth=0, hierarchy = None):
@@ -100,7 +105,7 @@ class STEPFile:
     @staticmethod
     def count_shapes_in_hierarchy(shape_info):
         """Count total number of shapes in a hierarchy."""
-        count = 1  # Count this shape
+        count = 1
 
         for child in shape_info.children:
             count += STEPFile.count_shapes_in_hierarchy(child)
@@ -108,7 +113,47 @@ class STEPFile:
 
 
     @staticmethod
-    def read_step_file_with_hierarchy(step_file_path: Union[str, Path], step_product_names: Optional[ProductDict] = None) -> Tuple[List[ComponentInfo], Any, Any]:
+    def _detect_step_units(reader: STEPCAFControl_Reader) -> Tuple[str, float]:
+        """Detect the units used in the STEP file and return scale factor to mm."""
+        try:
+            # Get the STEP reader's working session
+            ws = reader.WS()
+            if ws is None:
+                print("    ⚠️ Warning: Could not access STEP working session for unit detection")
+                return "mm", 1.0
+            
+            # Try to get the unit from the STEP construct
+            unit_tool = STEPConstruct_Units()
+            unit_name = unit_tool.GetUnitsName(ws.Model())
+            
+            if unit_name:
+                unit_str = unit_name.ToCString().lower()
+                print(f"    📏 Detected STEP units: {unit_str}")
+                
+                # Convert to scale factor (target: mm)
+                if 'mm' in unit_str or 'millim' in unit_str:
+                    return "mm", 1.0
+                elif 'm' in unit_str and 'mm' not in unit_str:  # meter
+                    return "m", 1000.0
+                elif 'in' in unit_str or 'inch' in unit_str:
+                    return "in", 25.4
+                elif 'ft' in unit_str or 'foot' in unit_str:
+                    return "ft", 304.8
+                elif 'cm' in unit_str or 'centim' in unit_str:
+                    return "cm", 10.0
+                else:
+                    print(f"    ⚠️ Unknown unit '{unit_str}', assuming mm")
+                    return "mm", 1.0
+            else:
+                print("    ⚠️ No unit information found in STEP file, assuming mm")
+                return "mm", 1.0
+                
+        except Exception as e:
+            print(f"    ⚠️ Error detecting STEP units: {e}, assuming mm")
+            return "mm", 1.0
+
+    @staticmethod
+    def read_step_file_with_hierarchy(step_file_path: Union[str, Path], step_product_names: Optional[ProductDict] = None) -> Tuple[List[ComponentInfo], Any, Any, str, float]:
         """Read STEP file and return hierarchical structure with transformations."""
         if step_product_names is None:
             step_product_names = {}
@@ -136,6 +181,10 @@ class STEPFile:
         
         print("Transferring data to XCAF document...")
         reader.Transfer(doc)
+        
+        print("Detecting STEP file units...")
+        units, unit_scale_factor = STEPFile._detect_step_units(reader)
+        print(f"    📏 Units: {units} (scale factor to mm: {unit_scale_factor})")
         
         print("Analyzing hierarchical structure...")
         labels: TDF_LabelSequence = TDF_LabelSequence()
@@ -189,7 +238,7 @@ class STEPFile:
             hierarchy.append(root_info)
         
         print(f"Hierarchy analysis complete!")
-        return hierarchy, shape_tool, color_tool
+        return hierarchy, shape_tool, color_tool, units, unit_scale_factor
 
     @staticmethod
     def extract_product_name_from_label(label: TDF_Label, default_name: Optional[str], step_product_names: Optional[ProductDict] = None) -> Optional[str]:
@@ -228,12 +277,7 @@ class STEPFile:
             attr_iter: TDF_AttributeIterator = TDF_AttributeIterator()
             attr_iter.Initialize(label, True)
             
-            while attr_iter.More():
-                attr: Any = attr_iter.Value()
-                
-                # Skip TDataStd_Name attributes as they cause issues in this OpenCASCADE version
-                # Use GetLabelName() instead
-                
+            while attr_iter.More():                
                 attr_iter.Next()
             
             parent_label: TDF_Label = label.Father()
@@ -318,7 +362,7 @@ class STEPFile:
         
         if not product_name and len(found_names) > 1:
             for name in found_names:
-                for entity_id, product_info in step_product_names.items():
+                for _, product_info in step_product_names.items():
                     product_candidate: str = product_info.name
                     if (name.lower() == product_candidate.lower() or
                         product_candidate.lower() in name.lower() or

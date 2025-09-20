@@ -16,8 +16,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from bruin_livery.step_convert.step_to_usd import convert_step_to_usd
-from bruin_livery.step_convert import config
+from src.step_convert.step_to_usd import convert_step_to_usd
+from src.step_convert import config
 
 def setup_config(args):
     """Update configuration based on command line arguments."""

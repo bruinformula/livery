@@ -1,20 +1,3 @@
-"""USD conversion and export functionality.
-
-TRANSFORMATION HANDLING:
-This module now handles transformations in USD space rather than baking them into geometry.
-
-Key changes:
-1. Geometry is kept in local coordinate space (no apply_location_to_shape)
-2. Each USD Xform prim gets the transformation from its STEP component
-3. Transformations are preserved as USD hierarchy rather than baked into vertices
-4. This enables proper manipulation, animation, and instancing in USD-aware applications
-
-Benefits:
-- Preserves parametric transformation hierarchy
-- Enables USD animation and manipulation
-- Supports proper instancing and referencing
-- More faithful to original STEP assembly structure
-"""
 
 from __future__ import annotations
 from typing import Any, Optional, List, Dict, Tuple, Protocol
@@ -32,8 +15,11 @@ from pxr import Usd, UsdGeom, Gf, Sdf, Tf
 from .name_utils import sanitize_usd_name, generate_unique_name
 from .geometry_processor import triangulate_shape, extract_faces
 from .calculate_normals import calculate_parametic_normals, ensure_consistent_winding_order
+from .calculate_uv import generate_face_varying_uv_coordinates, calculate_parametric_uv_coordinates
 from .edge_analysis import analyze_step_edges, generate_face_varying_normals
 from .step_reader import STEPFile, ComponentInfo
+from .crease_analysis import generate_usd_creases_from_edges
+
 
 # Type aliases for better readability
 Point3D = Tuple[float, float, float]
@@ -57,13 +43,16 @@ class ShapeToolProtocol(Protocol):
     pass
 
 try:
-    from .config import FORCE_CONSISTENT_WINDING, ENABLE_SHARP_EDGE_DETECTION, USE_FACE_VARYING_NORMALS
+    from .config import FORCE_CONSISTENT_WINDING, ENABLE_SHARP_EDGE_DETECTION, USE_FACE_VARYING_NORMALS, ENABLE_USD_CREASES, ENABLE_UV_COORDINATES
 except ImportError:
     # Default values if config not available
     FLIP_NORMALS: bool = False
     FORCE_CONSISTENT_WINDING: bool = True
     ENABLE_SHARP_EDGE_DETECTION: bool = True
     USE_FACE_VARYING_NORMALS: bool = True
+    ENABLE_USD_CREASES: bool = True  # NEW CONFIG OPTION
+    ENABLE_UV_COORDINATES: bool = True  # NEW CONFIG OPTION
+
 
 def convert_hierarchical_shape_to_usd(
     stage: Usd.Stage, 
@@ -117,8 +106,6 @@ def convert_hierarchical_shape_to_usd(
     if shape_info.location and not shape_info.location.IsIdentity():
         transform_matrix = toploc_to_usd_matrix(shape_info.location)
         xform.AddTransformOp().Set(transform_matrix)
-        print(f"{indent}TRANSFORM_DEBUG: Applied transform for {shape_info.name}")
-        print(f"{indent}TRANSFORM_DEBUG:   🔢 Transform matrix: {transform_matrix}")
     else:
         print(f"{indent}No transform applied for {shape_info.name} (identity or missing)")
     
@@ -192,12 +179,8 @@ def convert_hierarchical_shape_to_usd(
     # Process children
     if shape_info.children:
         for i, child_info in enumerate(shape_info.children):
-            print(f"{indent}CHILD_RECURSE_DEBUG: Recursing into child {i} of {shape_info.name} at depth {depth+1}")
             if shape_info.location and not shape_info.location.IsIdentity():
                 transform_matrix = toploc_to_usd_matrix(shape_info.location)
-                print(f"{indent}CHILD_RECURSE_DEBUG:   Parent transform matrix: {transform_matrix}")
-            else:
-                print(f"{indent}CHILD_RECURSE_DEBUG:   Parent transform is identity or missing")
             try:
                 convert_hierarchical_shape_to_usd(stage, xform, child_info, shape_tool, depth + 1, accumulated_transform)
             except Exception as e:
@@ -211,7 +194,7 @@ def convert_shape_to_usd_mesh(
     shape: TopoDS_Shape, 
     name: str
 ) -> Optional[UsdGeom.Mesh]:
-    """Convert a triangulated shape to a USD Mesh with optional sharp edge detection.
+    """Convert a triangulated shape to a USD Mesh with optional sharp edge detection and creases.
     
     Args:
         stage: USD stage
@@ -224,7 +207,7 @@ def convert_shape_to_usd_mesh(
     """
     
     triangulate_shape(shape)
-    faces: List[FaceData] = extract_faces(shape)
+    faces: List[FaceData] =  extract_faces(shape)
     
     if not faces:
         print(f"    Warning: No triangulated faces found for shape {name}")
@@ -243,13 +226,22 @@ def convert_shape_to_usd_mesh(
     
     # Generate mesh data with face-varying normals if sharp edges detected
     if USE_FACE_VARYING_NORMALS and sharp_edges:
-        return _create_mesh_with_face_varying_normals(
+        mesh = _create_mesh_with_face_varying_normals(
             stage, parent_prim, shape, name, faces, sharp_edges
         )
     else:
-        return _create_mesh_with_vertex_normals(
+        mesh = _create_mesh_with_vertex_normals(
             stage, parent_prim, shape, name, faces
         )
+    
+    # Add USD creases if enabled and we have a mesh
+    if ENABLE_USD_CREASES and mesh and sharp_edges:
+        try:
+            _add_usd_creases_to_mesh(mesh, faces, sharp_edges)
+        except Exception as e:
+            print(f"    Warning: Failed to add USD creases to {name}: {e}")
+    
+    return mesh
 
 
 def _create_mesh_with_face_varying_normals(
@@ -267,6 +259,16 @@ def _create_mesh_with_face_varying_normals(
         all_normals, all_face_vertex_counts, all_face_vertex_indices = generate_face_varying_normals(
             faces, sharp_edges
         )
+        
+        # Generate face-varying UV coordinates if enabled
+        all_uv_coords = []
+        if ENABLE_UV_COORDINATES:
+            try:
+                all_uv_coords, _, _ = generate_face_varying_uv_coordinates(faces, sharp_edges)
+                print(f"    📐 Generated {len(all_uv_coords)} UV coordinates")
+            except Exception as e:
+                print(f"    ⚠️ Warning: UV coordinate generation failed: {e}")
+                all_uv_coords = []
         
         # Build points list - for face-varying, each triangle gets unique vertices
         all_points: List[Point3D] = []
@@ -317,14 +319,32 @@ def _create_mesh_with_face_varying_normals(
         if all_normals:
             mesh.CreateNormalsAttr().Set(all_normals)
             mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+        
+        # Add UV coordinates as primvar if available
+        if ENABLE_UV_COORDINATES and all_uv_coords:
+            try:
+                # Create UV primvar for texture mapping using PrimvarsAPI
+                primvars_api = UsdGeom.PrimvarsAPI(mesh)
+                uv_primvar = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+                uv_primvar.Set(all_uv_coords)
+                print(f"    ✅ Added UV coordinates as 'st' primvar ({len(all_uv_coords)} values)")
+            except Exception as e:
+                print(f"    ⚠️ Warning: Failed to set UV primvar: {e}")
 
         print(f"    ✅ Created face-varying mesh: {len(all_points)} vertices, {len(all_face_vertex_counts)} faces")
+        
+        # Add creases if enabled (NEW FUNCTIONALITY)
+        if ENABLE_USD_CREASES and sharp_edges:
+            try:
+                _add_usd_creases_to_mesh(mesh, faces, sharp_edges)
+            except Exception as e:
+                print(f"    Warning: Failed to add creases to face-varying mesh: {e}")
+        
         return mesh
         
     except Exception as e:
         print(f"    Warning: Face-varying mesh creation failed for {name}: {e}")
         return None
-
 
 def _create_mesh_with_vertex_normals(
     stage: Usd.Stage,
@@ -405,9 +425,90 @@ def _create_mesh_with_vertex_normals(
     if all_normals:
         mesh.CreateNormalsAttr().Set(all_normals)
         mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+
+    # Add UV coordinates if enabled
+    if ENABLE_UV_COORDINATES:
+        try:
+            # Generate vertex-based UV coordinates for this mesh type
+            all_uv_coords = []
+            for face, triangulation in faces:
+                if triangulation is None:
+                    continue
+                
+                face_uvs, _ = calculate_parametric_uv_coordinates(face, triangulation, None, None)
+                all_uv_coords.extend(face_uvs)
+            
+            if all_uv_coords:
+                # Create UV primvar for texture mapping using PrimvarsAPI
+                primvars_api = UsdGeom.PrimvarsAPI(mesh)
+                uv_primvar = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying)
+                uv_primvar.Set(all_uv_coords)
+                print(f"    ✅ Added UV coordinates as 'st' primvar ({len(all_uv_coords)} values)")
+                
+        except Exception as e:
+            print(f"    ⚠️ Warning: UV coordinate generation failed: {e}")
+
+    mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+    
+    # Add creases if enabled and we detected sharp edges (NEW FUNCTIONALITY)
+    if ENABLE_USD_CREASES:
+        try:
+            # Re-run edge analysis just for crease generation if we didn't do it before
+            if not ENABLE_SHARP_EDGE_DETECTION:
+                print(f"    🔍 Running edge analysis for crease generation on {name}...")
+                all_edges, detected_sharp_edges = analyze_step_edges(shape)
+                if detected_sharp_edges:
+                    _add_usd_creases_to_mesh(mesh, faces, detected_sharp_edges)
+            # If we already have sharp edge detection enabled, creases were added in convert_shape_to_usd_mesh
+        except Exception as e:
+            print(f"    Warning: Failed to add creases to vertex normal mesh: {e}")
     
     return mesh
 
+
+def _add_usd_creases_to_mesh(
+    mesh: UsdGeom.Mesh,
+    faces: List[FaceData], 
+    sharp_edges: List[Any]
+) -> None:
+    """Add USD crease attributes to an existing mesh based on sharp edge analysis.
+    
+    This function adds standard USD crease attributes (creaseIndices, creaseLengths, 
+    creaseSharpnesses) to enable proper sharp edge rendering in USD-aware renderers.
+    
+    Args:
+        mesh: USD mesh to add creases to
+        faces: List of face data used to build the mesh
+        sharp_edges: List of detected sharp edges
+    """
+    print("    🎯 Adding USD creases to mesh...")
+    
+    try:
+        # Get the current mesh points for vertex mapping
+        points_attr = mesh.GetPointsAttr()
+        mesh_points = points_attr.Get()
+        
+        if not mesh_points:
+            print("    Warning: No mesh points available for crease generation")
+            return
+        
+        # Generate crease data from sharp edges
+        crease_data = generate_usd_creases_from_edges(faces, sharp_edges, mesh_points)
+        
+        if not crease_data.has_creases():
+            print("    No valid creases generated from sharp edges")
+            return
+        
+        # Set USD crease attributes
+        mesh.CreateCreaseIndicesAttr().Set(crease_data.edge_indices)
+        mesh.CreateCreaseLengthsAttr().Set([2] * len(crease_data.edge_sharpnesses))  # Each edge uses 2 indices
+        mesh.CreateCreaseSharpnessesAttr().Set(crease_data.edge_sharpnesses)
+        
+        num_creases = len(crease_data.edge_sharpnesses)
+        print(f"    ✅ Added {num_creases} USD creases to mesh")
+        
+    except Exception as e:
+        print(f"    Warning: Failed to add USD creases: {e}")
 
 
 def gp_trsf_to_usd_matrix(trsf: gp_Trsf) -> Gf.Matrix4d:

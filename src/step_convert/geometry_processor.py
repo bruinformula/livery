@@ -20,25 +20,7 @@ try:
 except ImportError:
     from config import MESH_LINEAR_DEFLECTION, MESH_ANGULAR_DEFLECTION
 
-# Type aliases for better readability
 FaceData = Tuple[TopoDS_Face, Poly_Triangulation]
-
-
-def extract_solids_from_shape(shape: TopoDS_Shape) -> List[TopoDS_Shape]:
-    """Extract individual solid bodies from a compound shape."""
-    solids: List[TopoDS_Shape] = []
-    explorer: TopExp_Explorer = TopExp_Explorer(shape, TopAbs_SOLID)
-    while explorer.More():
-        solid: TopoDS_Shape = explorer.Current()
-        solids.append(solid)
-        explorer.Next()
-    
-    # If no solids found, return the original shape
-    if not solids:
-        return [shape]
-    
-    return solids
-
 
 def triangulate_shape(shape: TopoDS_Shape) -> None:
     """Triangulate a shape for export using gmsh."""
@@ -53,7 +35,7 @@ def triangulate_shape(shape: TopoDS_Shape) -> None:
     
     # Fallback to OpenCASCADE triangulation
 
-    mesh: BRepMesh_IncrementalMesh = BRepMesh_IncrementalMesh(shape, MESH_LINEAR_DEFLECTION, False, MESH_ANGULAR_DEFLECTION, True)
+    mesh: BRepMesh_IncrementalMesh = BRepMesh_IncrementalMesh(shape, MESH_LINEAR_DEFLECTION, True, MESH_ANGULAR_DEFLECTION, False)
     mesh.Perform()
 
 

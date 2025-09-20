@@ -5,7 +5,6 @@ import uuid
 from typing import Dict
 from .step_reader import ProductInfo
 
-# Global set to track used names and avoid duplicates
 _used_names = set()
 
 def sanitize_usd_name(name):
@@ -20,7 +19,6 @@ def sanitize_usd_name(name):
     if sanitized and sanitized[0].isdigit():
         sanitized = f"prim_{sanitized}"
     
-    # Ensure it's not empty after sanitization
     if not sanitized:
         sanitized = "unnamed"
     
@@ -40,8 +38,7 @@ def extract_product_names_from_step_file(step_file_path) -> Dict[str, ProductInf
     try:
         with open(step_file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            
-        # Find PRODUCT entries using regex
+
         # PRODUCT ( 'name', 'description', '', ( #id ) ) ;
         product_pattern = r"PRODUCT\s*\(\s*'([^']+)'\s*,\s*'([^']*)'\s*,\s*'[^']*'\s*,\s*\(\s*#(\d+)\s*\)\s*\)\s*;"
         

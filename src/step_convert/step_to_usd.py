@@ -67,7 +67,7 @@ def convert_step_to_usd(step_path=None, usd_path=None):
         print(f"🏗️ Converting assembly {i+1}/{len(step_file.hierarchy)}: {shape_info.name}")
         
         # Convert the hierarchical shape
-        convert_hierarchical_shape_to_usd(stage, root, shape_info, step_file.shape_tool)
+        convert_hierarchical_shape_to_usd(stage, root, shape_info, step_file.shape_tool, 0, None, step_file)
         
         # Count shapes recursively
         shapes_in_assembly = STEPFile.count_shapes_in_hierarchy(shape_info)
